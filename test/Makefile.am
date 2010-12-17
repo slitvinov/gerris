@@ -32,9 +32,11 @@ TESTDIRS = \
 	parabola \
 	lonlat \
 	cosine \
+	planar \
 	bump \
 	cylinder \
-	electro
+	electro \
+	source
 
 EXTRA_DIST = \
 	template.tex \
