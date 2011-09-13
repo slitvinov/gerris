@@ -52,17 +52,13 @@ struct _FttVector {
 
 #if FTT_2D
 # define ftt_vector_norm(v) (sqrt((v)->x*(v)->x + (v)->y*(v)->y))
+# define ftt_vector_distance(v1,v2)  (sqrt(((v1)->x-(v2)->x)*((v1)->x-(v2)->x) + \
+					   ((v1)->y-(v2)->y)*((v1)->y-(v2)->y)))
 #else  /* 3D */
 # define ftt_vector_norm(v) (sqrt((v)->x*(v)->x + (v)->y*(v)->y + (v)->z*(v)->z))
-#endif /* 3D */
-
-#if FTT_2D
-# define ftt_vector_dist(v1,v2)  (sqrt(((v1)->x-(v2)->x)*((v1)->x-(v2)->x) + \
-                                 ((v1)->y-(v2)->y)*((v1)->y-(v2)->y)))
-#else  /* 3D */
-# define ftt_vector_dist(v1,v2) (sqrt(((v1)->x-(v2)->x)*((v1)->x-(v2)->x) + \
-                                 ((v1)->y-(v2)->y)*((v1)->y-(v2)->y)      + \
-                                 ((v1)->z-(v2)->z)*((v1)->z-(v2)->z)))
+# define ftt_vector_distance(v1,v2) (sqrt(((v1)->x-(v2)->x)*((v1)->x-(v2)->x) + \
+					  ((v1)->y-(v2)->y)*((v1)->y-(v2)->y)      + \
+					  ((v1)->z-(v2)->z)*((v1)->z-(v2)->z)))
 #endif /* 3D */
 
 typedef enum
@@ -590,13 +586,9 @@ FttCellFace ftt_cell_face (FttCell * cell,
 			   FttDirection d)
 {
   FttCellFace f;
-
-  g_return_val_if_fail (cell != NULL, f);
-
   f.cell = cell;
   f.neighbor = ftt_cell_neighbor (cell, d);
   f.d = d;
-
   return f;
 }
 
