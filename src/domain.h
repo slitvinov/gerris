@@ -28,6 +28,7 @@ extern "C" {
 #endif /* __cplusplus */
 
 typedef struct _GfsDomainClass     GfsDomainClass;
+typedef struct _GfsDiffusion       GfsDiffusion;
 typedef struct _GfsSourceDiffusion GfsSourceDiffusion;
 typedef struct _GfsTimer           GfsTimer;
 
@@ -81,6 +82,10 @@ struct _GfsDomain {
   gdouble (* solid_metric)      (const GfsDomain *, const FttCell *);
   gdouble (* scale_metric)      (const GfsDomain *, const FttCell *, FttComponent);
   gdouble (* face_scale_metric) (const GfsDomain *, const FttCellFace *, FttComponent);
+  gdouble (* viscous_metric)    (const GfsDomain * domain, 
+				 FttCell * cell,
+				 GfsVariable * v,
+				 GfsDiffusion * d);
 
   /* Object hash table for (optional) object IDs */
   GHashTable * objects;
@@ -441,7 +446,7 @@ gdouble gfs_domain_solid_metric (const GfsDomain * domain, const FttCell * cell)
  * @c: a #FttComponent.
  *
  * Returns: the @c component of the scale factor of the metric at the
- * center the face.
+ * center of the face.
  */
 static inline
 gdouble gfs_domain_face_scale_metric (const GfsDomain * domain, 

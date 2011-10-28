@@ -1,5 +1,5 @@
 /* Gerris - The GNU Flow Solver
- * Copyright (C) 2009 National Institute of Water and Atmospheric Research
+ * Copyright (C) 2009-2011 National Institute of Water and Atmospheric Research
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
@@ -25,6 +25,11 @@
 #include <complex.h>
 #include "map.h"
 #include "solid.h"
+#include "source.h"
+
+#if USE_GSL
+# include <gsl/gsl_integration.h>
+#endif
 
 /**
  * A generic class for metrics which require storage.
@@ -52,6 +57,645 @@ GfsVariableClass * gfs_variable_metric_class (void)
 }
 
 /** \endobject{GfsVariableMetric} */
+
+/** \beginobject{GfsGenericMetric} */
+
+#define USE_GSL 0
+
+/* Coefficients from http://sparse-grids.de/ */
+/* KPU: Univariate nested quadrature rules as basis - delayed
+   Kronrod-Patterson rules, see Knut Petras (2003): "Smolyak cubature
+   of given polynomial degree with few nodes for increasing
+   dimension." Numerische Mathematik 93, 729-753. */
+
+static double kpu_1d_l3[3][2] = {
+  {.1127017, .2777778},
+  {.5,       .4444444},
+  {.8872983, .2777778}
+};
+
+static double kpu_2d_l2[5][3] = {
+  {.1127017, .5,       .2777778},
+  {.5,       .1127017, .2777778},
+  {.5,       .5,      -.1111112},
+  {.5,       .8872983, .2777778},
+  {.8872983, .5,       .2777778}
+};
+
+static double kpu_2d_l3[9][3] = {
+  {.1127017, .1127017, .07716050617284001},
+  {.1127017, .5,       .12345678765432},
+  {.1127017, .8872983, .07716050617284001},
+  {.5,       .1127017, .12345678765432},
+  {.5,       .5,       .19753082469136002},
+  {.5,       .8872983, .12345678765432},
+  {.8872983, .1127017, .07716050617284001},
+  {.8872983, .5,       .12345678765432},
+  {.8872983, .8872983, .07716050617284001}
+};
+
+static double kpu_2d_l4[17][3] = {
+  { .0197544, .5, .052328105232810528 },
+  { .1127017, .1127017, .077160506172840024 },
+  { .1127017, .5, -.020076998921278625 },
+  { .1127017, .8872983, .077160506172840024 },
+  { .2828781, .5, .20069872006987202 },
+  { .5, .0197544, .052328105232810528 },
+  { .5, .1127017, -.020076998921278667 },
+  { .5, .2828781, .20069872006987202 },
+  { .5, .5, -.24044133021697545 },
+  { .5, .7171219, .20069872006987202 },
+  { .5, .8872983, -.020076998921278667 },
+  { .5, .9802456, .052328105232810528 },
+  { .7171219, .5, .20069872006987202 },
+  { .8872983, .1127017, .077160506172840024 },
+  { .8872983, .5, -.020076998921278625 },
+  { .8872983, .8872983, .077160506172840024 },
+  { .9802456, .5, .052328105232810528 },
+};
+
+#define EPS 1e-8
+
+static double ru_rv (FttVector r, GfsMap * map)
+{
+  FttVector ru = { r.x + EPS, r.y, 0. };
+  FttVector rv = { r.x, r.y + EPS, 0. };
+  (* map->inverse) (map, &r, &r);
+  (* map->inverse) (map, &ru, &ru);
+  (* map->inverse) (map, &rv, &rv);
+  ru.x -= r.x; ru.y -= r.y; ru.z -= r.z;
+  rv.x -= r.x; rv.y -= r.y; rv.z -= r.z;
+  return sqrt ((ru.x*ru.x + ru.y*ru.y + ru.z*ru.z)*(rv.x*rv.x + rv.y*rv.y + rv.z*rv.z)
+	       /* the cross-term should be zero for an orthogonal
+		  metric but we keep them for clarity*/
+	       - (ru.x*rv.x + ru.y*rv.y + ru.z*rv.z)*(ru.x*rv.x + ru.y*rv.y + ru.z*rv.z)
+	       );
+}
+
+static double integration2d (GfsMap * map,
+			     double u1, double v1,
+			     double u2, double v2)
+{
+  int i;
+  FttVector r;
+  double du = u2 - u1;
+  double dv = v2 - v1;
+  double a = 0.;
+  r.z = 0.;
+  for (i = 0; i < 9; i++) {
+    r.x = u1 + du*kpu_2d_l3[i][0];
+    r.y = v1 + dv*kpu_2d_l3[i][1];
+    a += kpu_2d_l3[i][2]*ru_rv (r, map);
+  }
+  return a*du*dv;
+}
+
+/* we set the error to one but the QNG code will use at least
+   21 points which is enough */
+#define QNG_21 1.
+
+typedef struct {
+  FttVector * r;
+  GfsMap * map;
+  gdouble v1, v2;
+} RuRvData;
+
+static double ru (FttVector r, GfsMap * map)
+{
+  FttVector dr = { r.x + EPS, r.y, 0. };
+  (* map->inverse) (map, &r, &r);
+  (* map->inverse) (map, &dr, &dr);
+  dr.x -= r.x; dr.y -= r.y; dr.z -= r.z;
+  return sqrt ((dr.x*dr.x + dr.y*dr.y + dr.z*dr.z));
+}
+
+static double rv (FttVector r, GfsMap * map)
+{
+  FttVector dr = { r.x, r.y + EPS, 0. };
+  (* map->inverse) (map, &r, &r);
+  (* map->inverse) (map, &dr, &dr);
+  dr.x -= r.x; dr.y -= r.y; dr.z -= r.z;
+  return sqrt ((dr.x*dr.x + dr.y*dr.y + dr.z*dr.z));
+}
+
+/* Returns: \sqrt{(r_u.r_u)} */
+#if USE_GSL
+static double ru_gsl (double u, void * data)
+{
+  RuRvData * p = data;
+  p->r->x = u;
+  return ru (*(p->r), p->map)/EPS;
+}
+
+/* Returns: \sqrt{(r_v.r_v)} */
+static double rv_gsl (double v, void * data)
+{
+  RuRvData * p = data;
+  p->r->y = v;
+  return rv (*(p->r), p->map)/EPS;
+}
+
+static gdouble integration (const gsl_function * f, double a, double b)
+{
+  double result, abserr;
+  size_t neval;
+  gsl_integration_qng (f, a, b, QNG_21, 0., &result, &abserr, &neval);
+  //  fprintf (stderr, "neval: %d abserr: %g result: %g\n", neval, abserr, result);
+  return result;
+}
+#endif /* USE_GSL */
+
+/* Returns: \int \sqrt{(r_u.r_u)} du */
+static double length_u (GfsMap * map, double u1, double u2, double v)
+{
+#if USE_GSL
+  FttVector r;
+  RuRvData p = { &r, map };
+  r.y = v;
+  r.z = 0.;
+  gsl_function f;
+  f.function = ru_gsl;
+  f.params = &p;
+  return integration (&f, u1, u2);
+#else
+  int i;
+  FttVector r;
+  double du = u2 - u1;
+  double a = 0.;
+  r.y = v;
+  r.z = 0.;
+  for (i = 0; i < 3; i++) {
+    r.x = u1 + du*kpu_1d_l3[i][0];
+    a += kpu_1d_l3[i][1]*ru (r, map);
+  }
+  return a*du/EPS;
+#endif
+}
+
+/* Returns: \int \sqrt{(r_v.r_v)} dv */
+static double length_v (GfsMap * map, double v1, double v2, double u)
+{
+#if USE_GSL
+  FttVector r;
+  gsl_function f;
+  RuRvData p = { &r, map };
+  f.function = rv_gsl;
+  f.params = &p;
+  r.x = u;
+  r.z = 0.;
+  return integration (&f, v1, v2);
+#else
+  int i;
+  FttVector r;
+  double dv = v2 - v1;
+  double a = 0.;
+  r.x = u;
+  r.z = 0.;
+  for (i = 0; i < 3; i++) {
+    r.y = v1 + dv*kpu_1d_l3[i][0];
+    a += kpu_1d_l3[i][1]*rv (r, map);
+  }
+  return a*dv/EPS;
+#endif
+}
+
+/* Returns: \sqrt{(r_u.r_u)(r_v.r_v) - (r_u.r_v)^2} */
+#if USE_GSL
+static double ru_rv_gsl (double v, void * data)
+{
+  RuRvData * p = data;
+  p->r->y = v;
+  return ru_rv (*(p->r), p->map)/(EPS*EPS);
+}
+
+/* Returns: \int \sqrt{(r_u.r_u)(r_v.r_v) - (r_u.r_v)^2} dv */
+static double ru_rv_dv (double u, void * data)
+{
+  RuRvData * p = data;
+  gsl_function f;
+  f.function = ru_rv_gsl;
+  f.params = p;
+  p->r->x = u;
+  return integration (&f, p->v1, p->v2);
+}
+#endif /* USE_GSL */
+
+/* Returns: \int\int \sqrt{(r_u.r_u)(r_v.r_v) - (r_u.r_v)^2} du dv */
+static double area (GfsMap * map,
+		    double u1, double v1,
+		    double u2, double v2)
+{
+#if USE_GSL
+  FttVector r;
+  gsl_function f;
+  RuRvData p = { &r, map, v1, v2 };
+  f.function = ru_rv_dv;
+  f.params = &p;
+  r.z = 0.;
+  return integration (&f, u1, u2);
+#else
+  return integration2d (map, u1, v1, u2, v2)/(EPS*EPS);
+#endif
+}
+
+static void metric_coarse_fine (FttCell * parent, GfsVariable * a)
+{
+  if (GFS_CELL_IS_BOUNDARY (parent))
+    return;
+
+  FttVector p;
+  FttCellChildren child;
+  gdouble h = ftt_cell_size (parent)/2., sa = 0.;
+  ftt_cell_children (parent, &child);
+  int i;
+
+  GfsGenericMetric * m = GFS_GENERIC_METRIC (a);
+  GfsMap * map = m->map;
+  for (i = 0; i < FTT_CELLS; i++) {
+    ftt_cell_pos (child.c[i], &p);
+    GFS_VALUE (child.c[i], a) = area (map, 
+				      p.x - h/2., p.y - h/2., 
+				      p.x + h/2., p.y + h/2.)/(h*h);
+    sa += GFS_VALUE (child.c[i], a);
+  }
+
+  if (m->e) {
+    double e = GFS_VALUE (parent, a) - sa/4.;
+    for (i = 0; i < FTT_CELLS; i++)
+      GFS_VALUE (child.c[i], m->e) = e;
+  }
+
+  ftt_cell_pos (parent, &p);
+
+  GFS_VALUE (child.c[0], m->h[0]) = GFS_VALUE (child.c[1], m->h[1]) = 
+    length_v (map, p.y, p.y + h, p.x)/h;
+  GFS_VALUE (child.c[0], m->h[3]) = GFS_VALUE (child.c[2], m->h[2]) = 
+    length_u (map, p.x - h, p.x, p.y)/h;
+  GFS_VALUE (child.c[2], m->h[0]) = GFS_VALUE (child.c[3], m->h[1]) = 
+    length_v (map, p.y - h, p.y, p.x)/h;
+  GFS_VALUE (child.c[1], m->h[3]) = GFS_VALUE (child.c[3], m->h[2]) = 
+    length_u (map, p.x, p.x + h, p.y)/h;
+
+  GFS_VALUE (child.c[0], m->h[2]) = length_u (map, p.x - h, p.x, p.y + h)/h;
+  GFS_VALUE (child.c[0], m->h[1]) = length_v (map, p.y, p.y + h, p.x - h)/h;
+  GFS_VALUE (child.c[1], m->h[2]) = length_u (map, p.x, p.x + h, p.y + h)/h;
+  GFS_VALUE (child.c[1], m->h[0]) = length_v (map, p.y, p.y + h, p.x + h)/h;
+  GFS_VALUE (child.c[2], m->h[3]) = length_u (map, p.x - h, p.x, p.y - h)/h;
+  GFS_VALUE (child.c[2], m->h[1]) = length_v (map, p.y - h, p.y, p.x - h)/h;
+  GFS_VALUE (child.c[3], m->h[3]) = length_u (map, p.x, p.x + h, p.y - h)/h;
+  GFS_VALUE (child.c[3], m->h[0]) = length_v (map, p.y - h, p.y, p.x + h)/h;
+}
+
+static void metric_fine_coarse (FttCell * parent, GfsVariable * a)
+{
+  FttCellChildren child;
+  guint n;
+
+  ftt_cell_children (parent, &child);
+  gdouble va = 0.;
+  for (n = 0; n < 4; n++)
+    va += GFS_VALUE (child.c[n], a);
+  GFS_VALUE (parent, a) = va/4.;
+
+  GfsGenericMetric * m = GFS_GENERIC_METRIC (a);
+  GFS_VALUE (parent, m->h[0]) = (GFS_VALUE (child.c[1], m->h[0]) +
+				 GFS_VALUE (child.c[3], m->h[0]))/2.;
+  GFS_VALUE (parent, m->h[1]) = (GFS_VALUE (child.c[0], m->h[1]) +
+				 GFS_VALUE (child.c[2], m->h[1]))/2.;
+  GFS_VALUE (parent, m->h[2]) = (GFS_VALUE (child.c[0], m->h[2]) +
+				 GFS_VALUE (child.c[1], m->h[2]))/2.;
+  GFS_VALUE (parent, m->h[3]) = (GFS_VALUE (child.c[2], m->h[3]) +
+				 GFS_VALUE (child.c[3], m->h[3]))/2.;
+}
+
+static gdouble face_metric (const GfsDomain * domain, const FttCellFace * face)
+{ 
+  if (face->d/2 > FTT_Y)
+    return 1.;
+  return GFS_VALUE (face->cell, GFS_GENERIC_METRIC (domain->metric_data)->h[face->d]);
+}
+
+static gdouble cell_metric (const GfsDomain * domain, const FttCell * cell)
+{
+  return GFS_VALUE (cell, GFS_VARIABLE1 (domain->metric_data));
+}
+
+static gdouble solid_metric (const GfsDomain * domain, const FttCell * cell)
+{
+  g_assert (GFS_IS_MIXED (cell));
+  g_assert_not_implemented ();
+  return 1;
+}
+
+static gdouble scale_metric (const GfsDomain * domain, const FttCell * cell, FttComponent c)
+{
+  /* fixme: this does not allow for Z-metric */
+  if (c > FTT_Y)
+    return 1.;
+  FttComponent d = FTT_ORTHOGONAL_COMPONENT (c);
+  return (GFS_VALUE (cell, GFS_GENERIC_METRIC (domain->metric_data)->h[2*d]) +
+	  GFS_VALUE (cell, GFS_GENERIC_METRIC (domain->metric_data)->h[2*d + 1]))/2.;
+}
+
+static gdouble face_scale_metric (const GfsDomain * domain, const FttCellFace * face,
+				  FttComponent c)
+{
+  /* fixme: this does not allow for Z-metric */
+  if (c > FTT_Y)
+    return 1.;
+  /* fixme: this is not second-order for fine/coarse faces */
+  return (scale_metric (domain, face->cell, c) + scale_metric (domain, face->neighbor, c))/2.;
+}
+
+static void none (FttCell * parent, GfsVariable * v)
+{
+}
+
+static gdouble face_metric_direction (const GfsDomain * domain, FttCell * cell, FttDirection d)
+{
+  FttCellFace f;
+  f.cell = cell;
+  f.d = d;
+  return (* domain->face_metric) (domain, &f);
+}
+
+/* see: doc/figures/viscous-metric.tm equation (4) */
+static gdouble viscous_metric (const GfsDomain * domain, 
+			       FttCell * cell,
+			       GfsVariable * v,
+			       GfsDiffusion * d)
+{
+  g_assert (v->component < FTT_DIMENSION);
+  /* fixme: 2D only */
+  if (v->component > 1)
+    return 0.;
+  FttComponent c1 = v->component;
+  FttComponent c2 = (c1 + 1) % 2;
+  double h1h2 = (* domain->cell_metric) (domain, cell);
+  double h1 = (* domain->scale_metric) (domain, cell, c1);
+  double h2 = (* domain->scale_metric) (domain, cell, c2);
+  double size = ftt_cell_size (cell);
+  double h1_2 = (face_metric_direction (domain, cell, 2*c2) - 
+		 face_metric_direction (domain, cell, 2*c2 + 1))/size;
+  double h2_1 = (face_metric_direction (domain, cell, 2*c1) - 
+		 face_metric_direction (domain, cell, 2*c1 + 1))/size;
+  double u1 = GFS_VALUE (cell, v);
+  double u2_1 = gfs_center_gradient (cell, c1, v->vector[c2]->i);
+  double u2_2 = gfs_center_gradient (cell, c2, v->vector[c2]->i);
+  double eta = gfs_diffusion_cell (d, cell);
+  /* fixme: this does not include the terms with derivatives of the viscosity yet */
+  /* fixme: this does not include the "curvature" of the metric yet */
+  return eta*(
+	      - u1*(h1_2*h1_2 + h2_1*h2_1)/h1h2 /* fixme: this term could be implicit */
+	      + 2.*(u2_1*h1_2/h1 - u2_2*h2_1/h2)
+	      )/h1h2;
+}
+
+static void generic_metric_read (GtsObject ** o, GtsFile * fp)
+{
+  (* GTS_OBJECT_CLASS (gfs_generic_metric_class ())->parent_class->read) (o, fp);
+  if (fp->type == GTS_ERROR)
+    return;
+
+  GfsDomain * domain = GFS_DOMAIN (gfs_object_simulation (*o));
+  if (domain->metric_data || domain->face_metric || domain->cell_metric || domain->solid_metric) {
+    gts_file_error (fp, "cannot use multiple metrics (yet)");
+    return;
+  }
+
+  GfsGenericMetric * m = GFS_GENERIC_METRIC (*o);
+  if (fp->type == GTS_STRING) {
+    if (!(m->e = gfs_domain_get_or_add_variable (domain, fp->token->str, "Metric error"))) {
+      gts_file_error (fp, "`%s' is a reserved variable name", fp->token->str);
+      return;
+    }
+    m->e->fine_coarse = m->e->coarse_fine = none;
+    gts_file_next_token (fp);
+  }
+
+  GfsVariable * a = GFS_VARIABLE1 (*o);
+  FttDirection d;
+  for (d = 0; d < 4; d++) {
+    gchar * name = g_strdup_printf ("%sh%d", a->name, d);
+    m->h[d] = gfs_domain_get_or_add_variable (domain, name, "Face metric");
+    m->h[d]->fine_coarse = m->h[d]->coarse_fine = none;
+    g_free (name);
+  }
+
+  g_free (a->description);
+  a->description = g_strdup ("Cell metric");
+  a->coarse_fine = metric_coarse_fine;
+  a->fine_coarse = metric_fine_coarse;
+
+  m->map = GFS_MAP (gts_object_new (GTS_OBJECT_CLASS (m->map_class)));
+  gfs_object_simulation_set (m->map, domain);
+  gts_container_add (GTS_CONTAINER (GFS_SIMULATION (domain)->maps), GTS_CONTAINEE (m->map));
+
+  domain->metric_data = *o;
+  domain->face_metric  = face_metric;
+  domain->cell_metric  = cell_metric;
+  domain->solid_metric = solid_metric;
+  domain->scale_metric = scale_metric;
+  domain->face_scale_metric = face_scale_metric;
+  domain->viscous_metric = viscous_metric;
+}
+
+static void generic_metric_class_init (GtsObjectClass * klass)
+{
+  klass->read = generic_metric_read;
+}
+
+static void generic_metric_init (GfsGenericMetric * m)
+{
+  m->map_class = gfs_map_class ();
+}
+
+GfsVariableClass * gfs_generic_metric_class (void)
+{
+  static GfsVariableClass * klass = NULL;
+
+  if (klass == NULL) {
+    GtsObjectClassInfo gfs_generic_metric_info = {
+      "GfsGenericMetric",
+      sizeof (GfsGenericMetric),
+      sizeof (GfsVariableClass),
+      (GtsObjectClassInitFunc) generic_metric_class_init,
+      (GtsObjectInitFunc) generic_metric_init,
+      (GtsArgSetFunc) NULL,
+      (GtsArgGetFunc) NULL
+    };
+    klass = gts_object_class_new (GTS_OBJECT_CLASS (gfs_variable_metric_class ()),
+				  &gfs_generic_metric_info);
+  }
+
+  return klass;
+}
+
+/** \endobject{GfsGenericMetric} */
+
+/* GfsMapMetric: Header */
+
+#define GFS_IS_MAP_METRIC(obj)         (gts_object_is_from_class (obj,\
+						 gfs_map_metric_class ()))
+
+static GfsMapClass * gfs_map_metric_class      (void);
+
+/* GfsMapMetric: Object */
+
+static void gfs_map_metric_read (GtsObject ** o, GtsFile * fp)
+{
+  /* this mapping cannot be used independently from GfsMetric */
+}
+
+static void gfs_map_metric_write (GtsObject * o, FILE * fp)
+{
+  /* this mapping cannot be used independently from GfsMetric */
+}
+
+static void gfs_map_metric_class_init (GfsMapClass * klass)
+{
+  GTS_OBJECT_CLASS (klass)->read = gfs_map_metric_read;
+  GTS_OBJECT_CLASS (klass)->write = gfs_map_metric_write;
+}
+
+static void map_metric_inverse (GfsMap * map, const FttVector * src, FttVector * dest)
+{
+  GfsMetric * m = GFS_DOMAIN (gfs_object_simulation (map))->metric_data;
+  FttVector src1 = *src; /* just in case src == dest */
+  FttComponent c;
+  for (c = 0; c < 3; c++)
+    if ((&m->x)[c])
+      (&dest->x)[c] = gfs_function_spatial_value ((&m->x)[c], &src1);
+    else
+      (&dest->x)[c] = (&src1.x)[c];
+}
+
+static void gfs_map_metric_init (GfsMap * map)
+{
+  map->inverse =   map_metric_inverse;
+}
+
+static GfsMapClass * gfs_map_metric_class (void)
+{
+  static GfsMapClass * klass = NULL;
+
+  if (klass == NULL) {
+    GtsObjectClassInfo gfs_map_metric_info = {
+      "GfsMapMetric",
+      sizeof (GfsMap),
+      sizeof (GfsMapClass),
+      (GtsObjectClassInitFunc) gfs_map_metric_class_init,
+      (GtsObjectInitFunc) gfs_map_metric_init,
+      (GtsArgSetFunc) NULL,
+      (GtsArgGetFunc) NULL
+    };
+    klass = gts_object_class_new (GTS_OBJECT_CLASS (gfs_map_class ()), &gfs_map_metric_info);
+  }
+
+  return klass;
+}
+
+/** \beginobject{GfsMetric} */
+
+static void metric_write (GtsObject * o, FILE * fp)
+{
+  (* GTS_OBJECT_CLASS (gfs_metric_class ())->parent_class->write) (o, fp);
+  
+  GfsMetric * m = GFS_METRIC (o);
+  fputs (" {", fp);
+  FttComponent c;
+  static gchar name[3][2] = {"X", "Y", "Z"};
+  for (c = 0; c < 3; c++)
+    if ((&m->x)[c]) {
+      fprintf (fp, "\n    %s = ", name[c]);
+      gfs_function_write ((&m->x)[c], fp);
+    }
+  fputs ("\n  }", fp);
+}
+
+static void metric_destroy (GtsObject * o)
+{
+  GfsMetric * m = GFS_METRIC (o);
+  FttComponent c;
+  for (c = 0; c < 3; c++)
+    if ((&m->x)[c])
+      gts_object_destroy (GTS_OBJECT ((&m->x)[c]));
+
+  (* GTS_OBJECT_CLASS (gfs_metric_class ())->parent_class->destroy) (o);
+}
+
+static void metric_read (GtsObject ** o, GtsFile * fp)
+{
+  (* GTS_OBJECT_CLASS (gfs_metric_class ())->parent_class->read) (o, fp);
+  if (fp->type == GTS_ERROR)
+    return;
+
+  if (fp->type != '{') {
+    gts_file_error (fp, "expecting a parameter block");
+    return;
+  }
+
+  GfsMetric * m = GFS_METRIC (*o);
+  GfsDomain * domain = GFS_DOMAIN (gfs_object_simulation (m));
+  GtsFileVariable var[] = {
+    {GTS_OBJ, "X", TRUE, &m->x},
+    {GTS_OBJ, "Y", TRUE, &m->y},
+    /* {GTS_OBJ, "Z", TRUE, &m->z}, fixme: Z metric does not work yet */
+    {GTS_NONE}
+  };
+  FttComponent c;
+  for (c = 0; c < 3; c++)
+    gfs_object_simulation_set ((&m->x)[c], domain);
+  
+  gts_file_assign_variables (fp, var);
+  
+  for (c = 0; c < 3; c++)
+    if (!var[c].set) {
+      gts_object_destroy (GTS_OBJECT ((&m->x)[c]));
+      (&m->x)[c] = NULL;
+    }
+  
+  if (fp->type == GTS_ERROR)
+    return;
+}
+
+static void metric_class_init (GtsObjectClass * klass)
+{
+  klass->destroy = metric_destroy;
+  klass->read = metric_read;
+  klass->write = metric_write;
+}
+
+static void metric_init (GfsMetric * m)
+{
+  GFS_GENERIC_METRIC (m)->map_class = gfs_map_metric_class ();
+  m->x = gfs_function_new (gfs_function_map_class (), 1.);
+  m->y = gfs_function_new (gfs_function_map_class (), 1.);
+  m->z = gfs_function_new (gfs_function_map_class (), 1.);
+}
+
+GfsVariableClass * gfs_metric_class (void)
+{
+  static GfsVariableClass * klass = NULL;
+
+  if (klass == NULL) {
+    GtsObjectClassInfo gfs_metric_info = {
+      "GfsMetric",
+      sizeof (GfsMetric),
+      sizeof (GfsVariableClass),
+      (GtsObjectClassInitFunc) metric_class_init,
+      (GtsObjectInitFunc) metric_init,
+      (GtsArgSetFunc) NULL,
+      (GtsArgGetFunc) NULL
+    };
+    klass = gts_object_class_new (GTS_OBJECT_CLASS (gfs_generic_metric_class ()),
+				  &gfs_metric_info);
+  }
+
+  return klass;
+}
+
+/** \endobject{GfsMetric} */
 
 /* "Expanded spherical cube" metric */
 
@@ -191,7 +835,8 @@ static void cmap_xy2XYZ (double x, double y, double * X, double * Y, double * Z)
 {
   x *= 2.; y *= 2.;
 
-  g_assert (x >= -1. && x <= 7. && y >= -1. && y <= 5.);
+  /* fixme: causes crash in gfsview when saving in gnuplot format */
+  //  g_assert (x >= -1. && x <= 7. && y >= -1. && y <= 5.);
 
   /* symmetries: see doc/figures/cubed.fig */
   double tmp;
@@ -348,7 +993,8 @@ static int face_num (gdouble X, gdouble Y, gdouble Z)
 static void map_cubed_transform (GfsMap * map, const FttVector * src, FttVector * dest)
 {
   GfsSimulation * sim = gfs_object_simulation (map);
-  double lon = (src->x*M_PI)/180., lat = src->y*M_PI/180.;
+  double lon = src->x*sim->physical_params.L*M_PI/180.;
+  double lat = src->y*sim->physical_params.L*M_PI/180.;
   double X = cos (lat)*sin (lon), Y = sin (lat), Z = cos(lat)*cos(lon);
   double x, y;
 
@@ -356,8 +1002,8 @@ static void map_cubed_transform (GfsMap * map, const FttVector * src, FttVector 
   switch (face_num(X,Y,Z)) {
   case 1:
     fmap_XYZ2xy (X, Y, fabs(Z), &x, &y);
-    dest->x = x/2.*sim->physical_params.L;
-    dest->y = y/2.*sim->physical_params.L;
+    dest->x = x/2.;
+    dest->y = y/2.;
     dest->z = src->z;
     break;
   case 2:
@@ -365,8 +1011,8 @@ static void map_cubed_transform (GfsMap * map, const FttVector * src, FttVector 
     X = cos (lat)*sin (lon);
     Z = sqrt (1. - X*X - Y*Y);
     fmap_XYZ2xy (X, Y, Z, &x, &y);
-    dest->x = (1. + x/2.)*sim->physical_params.L;
-    dest->y = y/2.*sim->physical_params.L;
+    dest->x = (1. + x/2.);
+    dest->y = y/2.;
     dest->z = src->z;
     break;
   case 3:
@@ -377,27 +1023,27 @@ static void map_cubed_transform (GfsMap * map, const FttVector * src, FttVector 
       X = cos (lat)*sin (lon);
       Z = sqrt (1. - X*X - Y*Y);
       fmap_XYZ2xy (X, Y, Z, &x, &y);
-      dest->x = (1. + x/2.)*sim->physical_params.L;
+      dest->x = (1. + x/2.);
       if (src->x < 0.)
-	dest->y = (1. + y/2.)*sim->physical_params.L;
+	dest->y = (1. + y/2.);
       else
-	dest->y = (1. - y/2.)*sim->physical_params.L;
+	dest->y = (1. - y/2.);
       dest->z = src->z;
     }
     else {
       fmap_XYZ2xy (X, Y, fabs(Z), &x, &y);
       if (src->x > -135. && src->x < 135.)
-	dest->x = (1. - y/2.)*sim->physical_params.L;
+	dest->x = (1. - y/2.);
       else
-	dest->x = (1. + y/2.)*sim->physical_params.L;
-      dest->y = (1. - x/2.)*sim->physical_params.L;
+	dest->x = (1. + y/2.);
+      dest->y = (1. - x/2.);
       dest->z = src->z;
     }
     break;
   case 4:
     fmap_XYZ2xy (X, Y, fabs(Z), &x, &y);
-    dest->x = (2. - y/2.)*sim->physical_params.L;
-    dest->y = (1. - x/2.)*sim->physical_params.L;
+    dest->x = (2. - y/2.);
+    dest->y = (1. - x/2.);
     dest->z = src->z;
     break;
   case 5:
@@ -405,8 +1051,8 @@ static void map_cubed_transform (GfsMap * map, const FttVector * src, FttVector 
     X = cos (lat)*sin (lon);
     Z = sqrt (1. - X*X - Y*Y);
     fmap_XYZ2xy (X, Y, Z, &x, &y);
-    dest->x = (2. - y/2.)*sim->physical_params.L;
-    dest->y = (2. + x/2.)*sim->physical_params.L;
+    dest->x = (2. - y/2.);
+    dest->y = (2. + x/2.);
     dest->z = src->z;
     break;
   case 6:
@@ -417,20 +1063,20 @@ static void map_cubed_transform (GfsMap * map, const FttVector * src, FttVector 
       X = cos (lat)*sin (lon);
       Z = sqrt (1. - X*X - Y*Y);
       fmap_XYZ2xy (X, Y, Z, &x, &y);
-      dest->y = (2. - x/2.)*sim->physical_params.L;
+      dest->y = (2. - x/2.);
       if (src->x < 0.)
-	dest->x = (3. + y/2.)*sim->physical_params.L;
+	dest->x = (3. + y/2.);
       else
-	dest->x = (3. - y/2.)*sim->physical_params.L;
+	dest->x = (3. - y/2.);
       dest->z = src->z;
     }
     else {
       fmap_XYZ2xy (X, Y, fabs(Z), &x, &y);
       if (src->x > -135. && src->x < 135.)
-	dest->y = (2. - y/2.)*sim->physical_params.L;
+	dest->y = (2. - y/2.);
       else
-	dest->y = (2. + y/2.)*sim->physical_params.L;
-      dest->x = (3. + x/2.)*sim->physical_params.L;
+	dest->y = (2. + y/2.);
+      dest->x = (3. + x/2.);
       dest->z = src->z;
     }
     break;
@@ -443,16 +1089,16 @@ static void map_cubed_inverse (GfsMap * map, const FttVector * src, FttVector * 
 {
   GfsSimulation * sim = gfs_object_simulation (map);
   double X, Y, Z;
-  cmap_xy2XYZ (src->x/sim->physical_params.L, src->y/sim->physical_params.L, &X, &Y, &Z);
-  dest->x = atan2 (X, Z)*180./M_PI;
-  dest->y = asin (Y)*180./M_PI;
+  cmap_xy2XYZ (src->x, src->y, &X, &Y, &Z);
+  dest->x = atan2 (X, Z)*180./M_PI/sim->physical_params.L;
+  dest->y = asin (Y)*180./M_PI/sim->physical_params.L;
   dest->z = src->z;
 }
 
 static void gfs_map_cubed_init (GfsMap * map)
 {
   map->transform = map_cubed_transform;
-  map->inverse =   map_cubed_inverse;
+  map->inverse =   map_cubed_inverse;  
 }
 
 static GfsMapClass * gfs_map_cubed_class (void)
@@ -480,34 +1126,6 @@ static GfsMapClass * gfs_map_cubed_class (void)
  * \beginobject{GfsMetricCubed}
  */
 
-static gdouble cubed_face_metric (const GfsDomain * domain, const FttCellFace * face)
-{
-  if (face->d/2 > FTT_Y)
-    return 1.;
-  return GFS_VALUE (face->cell, GFS_METRIC_CUBED (domain->metric_data)->h[face->d]);
-}
-
-static gdouble cubed_cell_metric (const GfsDomain * domain, const FttCell * cell)
-{
-  return GFS_VALUE (cell, GFS_VARIABLE1 (domain->metric_data));
-}
-
-static gdouble cubed_solid_metric (const GfsDomain * domain, const FttCell * cell)
-{
-  g_assert (GFS_IS_MIXED (cell));
-  g_assert_not_implemented ();
-  return 1.;
-}
-
-static gdouble cubed_scale_metric (const GfsDomain * domain, const FttCell * cell, FttComponent c)
-{
-  if (c > FTT_Y)
-    return 1.;
-  FttComponent d = FTT_ORTHOGONAL_COMPONENT (c);
-  return (GFS_VALUE (cell, GFS_METRIC_CUBED (domain->metric_data)->h[2*d]) +
-	  GFS_VALUE (cell, GFS_METRIC_CUBED (domain->metric_data)->h[2*d + 1]))/2.;
-}
-
 static gdouble cubed_face_scale_metric (const GfsDomain * domain, const FttCellFace * face,
 					FttComponent c)
 {
@@ -516,11 +1134,7 @@ static gdouble cubed_face_scale_metric (const GfsDomain * domain, const FttCellF
   /* fixme: here we assume that the metric is perfectly isotropic:
      this is not strictly the case numerically (0.08% difference), but
      is it the case theoretically? */
-  return GFS_VALUE (face->cell, GFS_METRIC_CUBED (domain->metric_data)->h[face->d]);
-}
-
-static void none (FttCell * parent, GfsVariable * v)
-{
+  return GFS_VALUE (face->cell, GFS_GENERIC_METRIC (domain->metric_data)->h[face->d]);
 }
 
 typedef struct {
@@ -626,47 +1240,26 @@ static void cubed_coarse_fine (FttCell * parent, GfsVariable * a)
   GFS_VALUE (child.c[2], a) = matrix_a (r, m, 0, 0);
   GFS_VALUE (child.c[3], a) = matrix_a (r, m, m, 0);
 
-  GFS_VALUE (child.c[0], cubed->h[0]) = GFS_VALUE (child.c[1], cubed->h[1]) = 
+  GfsGenericMetric * metric = GFS_GENERIC_METRIC (a);
+  GFS_VALUE (child.c[0], metric->h[0]) = GFS_VALUE (child.c[1], metric->h[1]) = 
     matrix_hy (r, m, m, m);
-  GFS_VALUE (child.c[0], cubed->h[3]) = GFS_VALUE (child.c[2], cubed->h[2]) = 
+  GFS_VALUE (child.c[0], metric->h[3]) = GFS_VALUE (child.c[2], metric->h[2]) = 
     matrix_hx (r, m, 0, m);
-  GFS_VALUE (child.c[2], cubed->h[0]) = GFS_VALUE (child.c[3], cubed->h[1]) = 
+  GFS_VALUE (child.c[2], metric->h[0]) = GFS_VALUE (child.c[3], metric->h[1]) = 
     matrix_hy (r, m, m, 0);
-  GFS_VALUE (child.c[1], cubed->h[3]) = GFS_VALUE (child.c[3], cubed->h[2]) = 
+  GFS_VALUE (child.c[1], metric->h[3]) = GFS_VALUE (child.c[3], metric->h[2]) = 
     matrix_hx (r, m, m, m);
 
-  GFS_VALUE (child.c[0], cubed->h[2]) = matrix_hx (r, m, 0, n - 1);
-  GFS_VALUE (child.c[0], cubed->h[1]) = matrix_hy (r, m, 0, m);
-  GFS_VALUE (child.c[1], cubed->h[2]) = matrix_hx (r, m, m, n - 1);
-  GFS_VALUE (child.c[1], cubed->h[0]) = matrix_hy (r, m, n - 1, m);
-  GFS_VALUE (child.c[2], cubed->h[3]) = matrix_hx (r, m, 0, 0);
-  GFS_VALUE (child.c[2], cubed->h[1]) = matrix_hy (r, m, 0, 0);
-  GFS_VALUE (child.c[3], cubed->h[0]) = matrix_hy (r, m, n - 1, 0);
-  GFS_VALUE (child.c[3], cubed->h[3]) = matrix_hx (r, m, m, 0);
+  GFS_VALUE (child.c[0], metric->h[2]) = matrix_hx (r, m, 0, n - 1);
+  GFS_VALUE (child.c[0], metric->h[1]) = matrix_hy (r, m, 0, m);
+  GFS_VALUE (child.c[1], metric->h[2]) = matrix_hx (r, m, m, n - 1);
+  GFS_VALUE (child.c[1], metric->h[0]) = matrix_hy (r, m, n - 1, m);
+  GFS_VALUE (child.c[2], metric->h[3]) = matrix_hx (r, m, 0, 0);
+  GFS_VALUE (child.c[2], metric->h[1]) = matrix_hy (r, m, 0, 0);
+  GFS_VALUE (child.c[3], metric->h[0]) = matrix_hy (r, m, n - 1, 0);
+  GFS_VALUE (child.c[3], metric->h[3]) = matrix_hx (r, m, m, 0);
 
   gfs_matrix_free (r);
-}
-
-static void cubed_fine_coarse (FttCell * parent, GfsVariable * a)
-{
-  GfsMetricCubed * cubed = GFS_METRIC_CUBED (a);
-  FttCellChildren child;
-  guint n;
-
-  ftt_cell_children (parent, &child);
-  gdouble va = 0.;
-  for (n = 0; n < 4; n++)
-    va += GFS_VALUE (child.c[n], a);
-  GFS_VALUE (parent, a) = va/4.;
-
-  GFS_VALUE (parent, cubed->h[0]) = (GFS_VALUE (child.c[1], cubed->h[0]) +
-				     GFS_VALUE (child.c[3], cubed->h[0]))/2.;
-  GFS_VALUE (parent, cubed->h[1]) = (GFS_VALUE (child.c[0], cubed->h[1]) +
-				     GFS_VALUE (child.c[2], cubed->h[1]))/2.;
-  GFS_VALUE (parent, cubed->h[2]) = (GFS_VALUE (child.c[0], cubed->h[2]) +
-				     GFS_VALUE (child.c[1], cubed->h[2]))/2.;
-  GFS_VALUE (parent, cubed->h[3]) = (GFS_VALUE (child.c[2], cubed->h[3]) +
-				     GFS_VALUE (child.c[3], cubed->h[3]))/2.;
 }
 
 static void metric_cubed_write (GtsObject * o, FILE * fp)
@@ -682,47 +1275,27 @@ static void metric_cubed_read (GtsObject ** o, GtsFile * fp)
   if (fp->type == GTS_ERROR)
     return;
 
-  GfsDomain * domain = GFS_DOMAIN (gfs_object_simulation (*o));
-  if (domain->metric_data || domain->face_metric || domain->cell_metric || domain->solid_metric) {
-    gts_file_error (fp, "cannot use multiple metrics (yet)");
-    return;
-  }
-
-  GfsVariable * a = GFS_VARIABLE1 (*o);
-  GfsMetricCubed * cubed = GFS_METRIC_CUBED (a);
+  GfsMetricCubed * cubed = GFS_METRIC_CUBED (*o);
   if (fp->type == GTS_INT) {
     cubed->level = atoi (fp->token->str);
     gts_file_next_token (fp);
   }
 
-  FttDirection d;
-  for (d = 0; d < 4; d++) {
-    gchar * name = g_strdup_printf ("%sh%d", a->name, d);
-    cubed->h[d] = gfs_domain_get_or_add_variable (domain, name, "Cubed face metric");
-    cubed->h[d]->fine_coarse = cubed->h[d]->coarse_fine = none;
-    g_free (name);
-  }
-  g_free (a->description);
-  a->description = g_strdup ("Cubed cell metric");
+  GfsVariable * a = GFS_VARIABLE1 (*o);
   a->coarse_fine = cubed_coarse_fine;
-  a->fine_coarse = cubed_fine_coarse;
 
-  GtsObject * map = gts_object_new (GTS_OBJECT_CLASS (gfs_map_cubed_class ()));
-  gfs_object_simulation_set (map, domain);
-  gts_container_add (GTS_CONTAINER (GFS_SIMULATION (domain)->maps), GTS_CONTAINEE (map));
-
-  domain->metric_data  = cubed;
-  domain->face_metric  = cubed_face_metric;
-  domain->cell_metric  = cubed_cell_metric;
-  domain->solid_metric = cubed_solid_metric;
-  domain->scale_metric = cubed_scale_metric;
-  domain->face_scale_metric = cubed_face_scale_metric;
+  a->domain->face_scale_metric = cubed_face_scale_metric;
 }
 
 static void metric_cubed_class_init (GtsObjectClass * klass)
 {
   klass->read = metric_cubed_read;
   klass->write = metric_cubed_write;
+}
+
+static void metric_cubed_init (GfsGenericMetric * m)
+{
+  m->map_class = gfs_map_cubed_class ();
 }
 
 GfsVariableClass * gfs_metric_cubed_class (void)
@@ -735,11 +1308,11 @@ GfsVariableClass * gfs_metric_cubed_class (void)
       sizeof (GfsMetricCubed),
       sizeof (GfsVariableClass),
       (GtsObjectClassInitFunc) metric_cubed_class_init,
-      (GtsObjectInitFunc) NULL,
+      (GtsObjectInitFunc) metric_cubed_init,
       (GtsArgSetFunc) NULL,
       (GtsArgGetFunc) NULL
     };
-    klass = gts_object_class_new (GTS_OBJECT_CLASS (gfs_variable_metric_class ()), 
+    klass = gts_object_class_new (GTS_OBJECT_CLASS (gfs_generic_metric_class ()), 
 				  &gfs_metric_cubed_info);
   }
 
@@ -1232,477 +1805,11 @@ GfsEventClass * gfs_metric_stretch_class (void)
   return klass;
 }
 
-/* GfsGenericMetric: Object */
+/** \endobject{GfsMetricStretch} */
 
-static void metric_point_new (GfsMap * map, Point * p, double x, double y)
-{
-#if 1
-  p->x = x; p->y = y; p->z = 0.;
-#else
-  p->x = x*M_PI/2.; p->y = y*M_PI/2.; p->z = 0.;
-#endif
-  FttVector r;
-  (* map->inverse) (map, (FttVector *)&p->x, &r);
-  p->x1 = r.x; p->y1 = r.y; p->z1 = r.z;
-  p->x = x; p->y = y;
-}
-
-static Point ** metric_matrix_refine (GfsMap * map, Point ** m, int n)
-{
-  int n1 = 2*n - 1, i, j;
-  Point ** r = gfs_matrix_new (n1, n1, sizeof (Point));
-  for (i = 0; i < n; i++)
-    for (j = 0; j < n; j++)
-      r[2*i][2*j] = m[i][j];
-  for (i = 0; i < n - 1; i++)
-    for (j = 0; j < n - 1; j++) {
-      metric_point_new (map, &r[2*i+1][2*j], (m[i][j].x + m[i+1][j].x)/2., m[i][j].y);
-      metric_point_new (map, &r[2*i][2*j+1], m[i][j].x, (m[i][j].y + m[i][j+1].y)/2.);
-      metric_point_new (map, &r[2*i+1][2*j+1], 
-			(m[i][j].x + m[i+1][j].x)/2., 
-			(m[i][j].y + m[i][j+1].y)/2.);
-    }
-  i = n - 1;
-  for (j = 0; j < n - 1; j++)
-    metric_point_new (map, &r[2*i][2*j+1], m[i][j].x, (m[i][j].y + m[i][j+1].y)/2.);
-  j = n - 1;
-  for (i = 0; i < n - 1; i++)
-    metric_point_new (map, &r[2*i+1][2*j], (m[i][j].x + m[i+1][j].x)/2., m[i][j].y);
-  gfs_matrix_free (m);
-  return r;
-}
-
-static Point ** metric_matrix_from_cell (GfsMap * map, FttCell * cell)
-{
-  FttVector p;
-  ftt_cell_pos (cell, &p);
-  double h = ftt_cell_size (cell)/2.;
-  Point ** r = gfs_matrix_new (2, 2, sizeof (Point));
-  metric_point_new (map, &r[0][0], p.x - h, p.y - h);
-  metric_point_new (map, &r[1][0], p.x + h, p.y - h);
-  metric_point_new (map, &r[1][1], p.x + h, p.y + h);
-  metric_point_new (map, &r[0][1], p.x - h, p.y + h);
-  return r;
-}
-
-static double metric_matrix_a (Point ** r, int m, int i0, int j0)
-{
-  int i, j;
-  double a = 0.;
-  double h = r[m][0].x - r[0][0].x;
-  for (i = 0; i < m; i++)
-    for (j = 0; j < m; j++) {
-      /* area of an arbitrary quadrilateral (Varignon's formula) */
-      fprintf (stderr, "p: %g %g %g\np: %g %g %g\np: %g %g %g\np: %g %g %g\n",
-	       r[i0+i][j0+j].x1, r[i0+i][j0+j].y1, r[i0+i][j0+j].z1,
-	       r[i0+i+1][j0+j].x1,   r[i0+i+1][j0+j].y1,   r[i0+i+1][j0+j].z1,
-	       r[i0+i+1][j0+j+1].x1, r[i0+i+1][j0+j+1].y1, r[i0+i+1][j0+j+1].z1,
-	       r[i0+i][j0+j+1].x1,   r[i0+i][j0+j+1].y1,   r[i0+i][j0+j+1].z1);
-      GtsVector V0 = { r[i0+i][j0+j].x1,     r[i0+i][j0+j].y1,     r[i0+i][j0+j].z1 };
-      GtsVector V1 = { r[i0+i+1][j0+j].x1,   r[i0+i+1][j0+j].y1,   r[i0+i+1][j0+j].z1 };
-      GtsVector V2 = { r[i0+i+1][j0+j+1].x1, r[i0+i+1][j0+j+1].y1, r[i0+i+1][j0+j+1].z1 };
-      GtsVector V3 = { r[i0+i][j0+j+1].x1,   r[i0+i][j0+j+1].y1,   r[i0+i][j0+j+1].z1 };
-      GtsVector V2V0 = { V2[0] - V0[0], V2[1] - V0[1], V2[2] - V0[2] };
-      GtsVector V3V1 = { V3[0] - V1[0], V3[1] - V1[1], V3[2] - V1[2] };
-      GtsVector C;
-      gts_vector_cross (C, V2V0, V3V1);
-      a += gts_vector_norm (C);
-    }
-  fprintf (stderr, "a: %g h: %g\n", a/2., h);
-  return a/(2.*h*h);
-}
-
-#define EPS 1e-8
-
-static double ru_rv (FttVector r, GfsMap * map)
-{
-  FttVector ru = { r.x + EPS, r.y, 0. };
-  FttVector rv = { r.x, r.y + EPS, 0. };
-  (* map->inverse) (map, &r, &r);
-  (* map->inverse) (map, &ru, &ru);
-  (* map->inverse) (map, &rv, &rv);
-  ru.x = (ru.x - r.x); ru.y = (ru.y - r.y); ru.z = (ru.z - r.z); 
-  rv.x = (rv.x - r.x); rv.y = (rv.y - r.y); rv.z = (rv.z - r.z);
-  return sqrt ((ru.x*ru.x + ru.y*ru.y + ru.z*ru.z)*(rv.x*rv.x + rv.y*rv.y + rv.z*rv.z)
-	       /* the cross-term should be zero for an orthogonal
-		  metric but we keep them for clarity*/
-	       - (ru.x*rv.x + ru.y*rv.y + ru.z*rv.z)*(ru.x*rv.x + ru.y*rv.y + ru.z*rv.z)
-	       );
-}
-
-typedef struct {
-  FttVector * r;
-  GfsMap * map;
-  gdouble v1, v2;
-} RuRvData;
-
-/* Returns: \sqrt{(r_u.r_u)(r_v.r_v) - (r_u.r_v)^2} */
-static double ru_rv_gsl (double v, void * data)
-{
-  RuRvData * p = data;
-  p->r->y = v;
-  return ru_rv (*(p->r), p->map)/(EPS*EPS);
-}
-
-/* Returns: \int \sqrt{(r_u.r_u)(r_v.r_v) - (r_u.r_v)^2} dv */
-static double ru_rv_dv (double u, void * data)
-{
-  RuRvData * p = data;
-  gsl_function f;
-  f.function = ru_rv_gsl;
-  f.params = p;
-  p->r->x = u;
-  double result, abserr;
-  size_t neval;
-  gsl_integration_qng (&f, p->v1, p->v2, 0., 1e-6, &result, &abserr, &neval);
-  //  fprintf (stderr, "neval1: %d abserr: %g result: %g\n", neval, abserr, result);
-  return result;
-}
-
-#if 0
-static double area (GfsMap * map,
-		    double u1, double v1,
-		    double u2, double v2,
-		    int np)
-{
-  FttVector r;
-  double a = 0.;
-  double du = (u2 - u1)/np;
-  double dv = (v2 - v1)/np;
-  int i, j;
-  r.z = 0.;
-  for (i = 0; i < np; i++) {
-    r.x = u1 + du*i;
-    for (j = 0; j < np; j++) {
-      r.y = v1 + dv*j;
-      a += ru_rv (r, map);
-    }
-  }
-  return a*du*dv/(EPS*EPS);
-}
-#else
-
-/* Returns: \int\int \sqrt{(r_u.r_u)(r_v.r_v) - (r_u.r_v)^2} du dv */
-static double area (GfsMap * map,
-		    double u1, double v1,
-		    double u2, double v2,
-		    int n)
-{
-  FttVector r;
-  gsl_function f;
-  RuRvData p = { &r, map, v1, v2 };
-  f.function = ru_rv_dv;
-  f.params = &p;
-  r.z = 0.;
-  double result, abserr;
-  size_t neval;
-  gsl_integration_qng (&f, u1, u2, 0., 1e-6, &result, &abserr, &neval);
-  //  fprintf (stderr, "neval2: %d abserr: %g result: %g\n", neval, abserr, result);
-  return result;
-}
-#endif
-
-static void metric_coarse_fine (FttCell * parent, GfsVariable * a)
-{
-  if (GFS_CELL_IS_BOUNDARY (parent))
-    return;
-
-#if 0
-  GfsGenericMetric * metric = GFS_GENERIC_METRIC (a);
-  GfsSimulation * sim = gfs_object_simulation (a);
-  Point ** r = metric_matrix_from_cell (metric->map, parent);
-  r = metric_matrix_refine (metric->map, r, 2);
-  int n = 3, level = 5/*metric->level*/ - (ftt_cell_level (parent) + 1);
-  while (level-- > 0) {
-    r = metric_matrix_refine (metric->map, r, n);
-    n = 2*n - 1;
-  }
-
-  FttCellChildren child;
-  ftt_cell_children (parent, &child);
-  int m = n/2;
-
-#if 1
-  GFS_VALUE (child.c[0], a) = metric_matrix_a (r, m, 0, m);
-  GFS_VALUE (child.c[1], a) = metric_matrix_a (r, m, m, m);
-  GFS_VALUE (child.c[2], a) = metric_matrix_a (r, m, 0, 0);
-  GFS_VALUE (child.c[3], a) = metric_matrix_a (r, m, m, 0);
-#else
-  GFS_VALUE (child.c[0], a) = matrix_a (r, m, 0, m);
-  GFS_VALUE (child.c[1], a) = matrix_a (r, m, m, m);
-  GFS_VALUE (child.c[2], a) = matrix_a (r, m, 0, 0);
-  GFS_VALUE (child.c[3], a) = matrix_a (r, m, m, 0);
-#endif
-  gfs_matrix_free (r);
-#else
-  FttCellChildren child;
-  gdouble h = ftt_cell_size (parent)/2.;
-  ftt_cell_children (parent, &child);
-  int i;
-  
-  for (i = 0; i < FTT_CELLS; i++) {
-    FttVector p;
-    ftt_cell_pos (child.c[i], &p);
-    GFS_VALUE (child.c[i], a) = area (GFS_GENERIC_METRIC (a)->map, 
-				      p.x - h/2., p.y - h/2., 
-				      p.x + h/2., p.y + h/2.,
-				      10)/(h*h);
-  }
-#endif
-}
-
-static void metric_fine_coarse (FttCell * parent, GfsVariable * a)
-{
-  FttCellChildren child;
-  guint n;
-
-  ftt_cell_children (parent, &child);
-  gdouble va = 0.;
-  for (n = 0; n < 4; n++)
-    va += GFS_VALUE (child.c[n], a);
-  GFS_VALUE (parent, a) = va/4.;
-}
-
-static gdouble face_metric (const GfsDomain * domain, const FttCellFace * face)
-{ 
-  GfsGenericMetric * s = GFS_GENERIC_METRIC (domain->metric_data);
-  return 1.;
-}
-
-static gdouble cell_metric (const GfsDomain * domain, const FttCell * cell)
-{
-  return GFS_VALUE (cell, GFS_VARIABLE1 (domain->metric_data));
-}
-
-static gdouble solid_metric (const GfsDomain * domain, const FttCell * cell)
-{
-  g_assert_not_implemented ();
-  return 1;
-}
-
-static gdouble scale_metric (const GfsDomain * domain, const FttCell * cell, FttComponent c)
-{
-  return 1.;
-}
-
-static gdouble face_scale_metric (const GfsDomain * domain, const FttCellFace * face,
-					  FttComponent c)
-{
-  return 1.;
-}
-
-static void generic_metric_read (GtsObject ** o, GtsFile * fp)
-{
-  (* GTS_OBJECT_CLASS (gfs_generic_metric_class ())->parent_class->read) (o, fp);
-  if (fp->type == GTS_ERROR)
-    return;
-
-  GfsDomain * domain = GFS_DOMAIN (gfs_object_simulation (*o));
-  if (domain->metric_data || domain->face_metric || domain->cell_metric || domain->solid_metric) {
-    gts_file_error (fp, "cannot use multiple metrics (yet)");
-    return;
-  }
-
-  GfsVariable * a = GFS_VARIABLE1 (*o);
-  g_free (a->description);
-  a->description = g_strdup ("Cell metric");
-  a->coarse_fine = metric_coarse_fine;
-  a->fine_coarse = metric_fine_coarse;
-
-  GfsGenericMetric * m = GFS_GENERIC_METRIC (*o);
-  m->map = GFS_MAP (gts_object_new (GTS_OBJECT_CLASS (m->map_class)));
-  gfs_object_simulation_set (m->map, domain);
-  gts_container_add (GTS_CONTAINER (GFS_SIMULATION (domain)->maps), GTS_CONTAINEE (m->map));
-
-  domain->metric_data = *o;
-  domain->face_metric  = face_metric;
-  domain->cell_metric  = cell_metric;
-  domain->solid_metric = solid_metric;
-  domain->scale_metric = scale_metric;
-  domain->face_scale_metric = face_scale_metric;
-}
-
-static void generic_metric_class_init (GtsObjectClass * klass)
-{
-  klass->read = generic_metric_read;
-}
-
-static void generic_metric_init (GfsGenericMetric * m)
-{
-  m->map_class = gfs_map_class ();
-}
-
-GfsVariableClass * gfs_generic_metric_class (void)
-{
-  static GfsVariableClass * klass = NULL;
-
-  if (klass == NULL) {
-    GtsObjectClassInfo gfs_generic_metric_info = {
-      "GfsGenericMetric",
-      sizeof (GfsGenericMetric),
-      sizeof (GfsVariableClass),
-      (GtsObjectClassInitFunc) generic_metric_class_init,
-      (GtsObjectInitFunc) generic_metric_init,
-      (GtsArgSetFunc) NULL,
-      (GtsArgGetFunc) NULL
-    };
-    klass = gts_object_class_new (GTS_OBJECT_CLASS (gfs_variable_metric_class ()),
-				  &gfs_generic_metric_info);
-  }
-
-  return klass;
-}
-
-/* GfsMapMetric: Header */
-
-#define GFS_IS_MAP_METRIC(obj)         (gts_object_is_from_class (obj,\
-						 gfs_map_metric_class ()))
-
-static GfsMapClass * gfs_map_metric_class      (void);
-
-/* GfsMapMetric: Object */
-
-static void gfs_map_metric_read (GtsObject ** o, GtsFile * fp)
-{
-  /* this mapping cannot be used independently from GfsMetric */
-}
-
-static void gfs_map_metric_write (GtsObject * o, FILE * fp)
-{
-  /* this mapping cannot be used independently from GfsMetric */
-}
-
-static void gfs_map_metric_class_init (GfsMapClass * klass)
-{
-  GTS_OBJECT_CLASS (klass)->read = gfs_map_metric_read;
-  GTS_OBJECT_CLASS (klass)->write = gfs_map_metric_write;
-}
-
-static void map_metric_transform (GfsMap * map, const FttVector * src, FttVector * dest)
-{
-  g_assert_not_implemented ();
-}
-
-static void map_metric_inverse (GfsMap * map, const FttVector * src, FttVector * dest)
-{
-  GfsMetric * s = GFS_DOMAIN (gfs_object_simulation (map))->metric_data;
-  FttVector src1 = *src;
-  FttComponent c;
-  for (c = 0; c < 3; c++)
-    (&dest->x)[c] = gfs_function_spatial_value ((&s->x)[c], &src1);
-}
-
-static void gfs_map_metric_init (GfsMap * map)
-{
-  map->transform = map_metric_transform;
-  map->inverse =   map_metric_inverse;
-}
-
-static GfsMapClass * gfs_map_metric_class (void)
-{
-  static GfsMapClass * klass = NULL;
-
-  if (klass == NULL) {
-    GtsObjectClassInfo gfs_map_metric_info = {
-      "GfsMapMetric",
-      sizeof (GfsMap),
-      sizeof (GfsMapClass),
-      (GtsObjectClassInitFunc) gfs_map_metric_class_init,
-      (GtsObjectInitFunc) gfs_map_metric_init,
-      (GtsArgSetFunc) NULL,
-      (GtsArgGetFunc) NULL
-    };
-    klass = gts_object_class_new (GTS_OBJECT_CLASS (gfs_map_class ()), &gfs_map_metric_info);
-  }
-
-  return klass;
-}
-
-/* GfsMetric: Object */
-
-static void metric_write (GtsObject * o, FILE * fp)
-{
-  (* GTS_OBJECT_CLASS (gfs_metric_class ())->parent_class->write) (o, fp);
-  
-  GfsMetric * m = GFS_METRIC (o);
-  fputs (" {", fp);
-  fputs ("\n  X = ", fp);
-  gfs_function_write (m->x, fp);
-  fputs ("\n  Y = ", fp);
-  gfs_function_write (m->y, fp);
-  fputs ("\n  Z = ", fp);
-  gfs_function_write (m->z, fp);
-  fputs ("\n}", fp);
-}
-
-static void metric_destroy (GtsObject * o)
-{
-  gts_object_destroy (GTS_OBJECT (GFS_METRIC (o)->x));
-  gts_object_destroy (GTS_OBJECT (GFS_METRIC (o)->y));
-  gts_object_destroy (GTS_OBJECT (GFS_METRIC (o)->z));
-
-  (* GTS_OBJECT_CLASS (gfs_metric_class ())->parent_class->destroy) (o);
-}
-
-static void metric_read (GtsObject ** o, GtsFile * fp)
-{
-  (* GTS_OBJECT_CLASS (gfs_metric_class ())->parent_class->read) (o, fp);
-  if (fp->type == GTS_ERROR)
-    return;
-
-  if (fp->type == '{') {
-    GfsMetric * m = GFS_METRIC (*o);
-    GfsDomain * domain = GFS_DOMAIN (gfs_object_simulation (m));
-    GtsFileVariable var[] = {
-      {GTS_OBJ, "X", TRUE, &m->x},
-      {GTS_OBJ, "Y", TRUE, &m->y},
-      {GTS_OBJ, "Z", TRUE, &m->z},
-      {GTS_NONE}
-    };
-    gfs_object_simulation_set (m->x, domain);
-    gfs_object_simulation_set (m->y, domain);
-    gfs_object_simulation_set (m->z, domain);
-    gts_file_assign_variables (fp, var);
-    if (fp->type == GTS_ERROR)
-      return;
-  }
-}
-
-static void metric_class_init (GtsObjectClass * klass)
-{
-  klass->destroy = metric_destroy;
-  klass->read = metric_read;
-  klass->write = metric_write;
-}
-
-static void metric_init (GfsMetric * m)
-{
-  GFS_GENERIC_METRIC (m)->map_class = gfs_map_metric_class ();
-  m->x = gfs_function_new (gfs_function_map_class (), 1.);
-  m->y = gfs_function_new (gfs_function_map_class (), 1.);
-  m->z = gfs_function_new (gfs_function_map_class (), 1.);
-}
-
-GfsVariableClass * gfs_metric_class (void)
-{
-  static GfsVariableClass * klass = NULL;
-
-  if (klass == NULL) {
-    GtsObjectClassInfo gfs_metric_info = {
-      "GfsMetric",
-      sizeof (GfsMetric),
-      sizeof (GfsVariableClass),
-      (GtsObjectClassInitFunc) metric_class_init,
-      (GtsObjectInitFunc) metric_init,
-      (GtsArgSetFunc) NULL,
-      (GtsArgGetFunc) NULL
-    };
-    klass = gts_object_class_new (GTS_OBJECT_CLASS (gfs_generic_metric_class ()),
-				  &gfs_metric_info);
-  }
-
-  return klass;
-}
+/* GfsMetricCubed1 is a reimplementation of GfsMetricCubed using
+   GfsGenericMetric. This is left here as an example of how to
+   implement a complex metric relatively simply. */
 
 /* GfsMapCubed1: Header */
 
@@ -1729,21 +1836,17 @@ static void gfs_map_cubed1_class_init (GfsMapClass * klass)
   GTS_OBJECT_CLASS (klass)->write = gfs_map_cubed1_write;
 }
 
-static void map_cubed1_transform (GfsMap * map, const FttVector * src, FttVector * dest)
-{
-  g_assert_not_implemented ();
-}
-
 static void map_cubed1_inverse (GfsMap * map, const FttVector * src, FttVector * dest)
 {
   cmap_xy2XYZ (src->x, src->y, &dest->x, &dest->y, &dest->z);
-  dest->x *= 2./M_PI; dest->y *= 2./M_PI; dest->z *= 2./M_PI;
+  dest->x *= 2./M_PI;
+  dest->y *= 2./M_PI; 
+  dest->z *= 2./M_PI;
 }
 
 static void gfs_map_cubed1_init (GfsMap * map)
 {
-  map->transform = map_cubed1_transform;
-  map->inverse =   map_cubed1_inverse;
+  map->inverse = map_cubed1_inverse;
 }
 
 static GfsMapClass * gfs_map_cubed1_class (void)
@@ -1794,4 +1897,3 @@ GfsVariableClass * gfs_metric_cubed1_class (void)
   return klass;
 }
 
-/** \endobject{GfsMetricStretch} */
