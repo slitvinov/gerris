@@ -1,5 +1,5 @@
 /* Gerris - The GNU Flow Solver
- * Copyright (C) 2001-2008 National Institute of Water and Atmospheric Research
+ * Copyright (C) 2001-2011 National Institute of Water and Atmospheric Research
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
@@ -71,6 +71,111 @@ static void not_implemented (GfsMap * map, const FttVector * src, FttVector * de
   g_assert_not_implemented ();
 }
 
+static double evaluate (GfsMap * map, const FttVector * x, const FttVector * rhs, FttVector * f)
+{
+  gdouble delta = 0.;
+  (* map->inverse) (map, x, f);
+  int i;
+  for (i = 0; i < 3; i++) {
+    (&f->x)[i] -= (&rhs->x)[i];
+    delta += (&f->x)[i]*(&f->x)[i];
+  }
+  return delta;
+}
+
+#define DELTA 1e-6
+#define NMAX 100
+
+static void jacobian (GfsMap * map, const FttVector * x, const FttVector * rhs, FttVector * f,
+		      GtsMatrix * J)
+{
+  int i, j;
+  for (i = 0; i < 3; i++)
+    for (j = 0; j < 3; j++) {
+      FttVector df, dx = *x;
+      (&dx.x)[j] += DELTA;
+      (* map->inverse) (map, &dx, &df);
+      J[i][j] = ((&df.x)[i] - (&rhs->x)[i] - (&f->x)[i])/DELTA;
+    }
+}
+
+static void map_transform (GfsMap * map, const FttVector * src, FttVector * dest)
+{
+  FttVector f, rhs = *src;
+  GtsMatrix J[4];
+  int n = 0;
+  /* use multidimensional Newton iterations to invert map(dest) = src */
+  *dest = *src; /* use src as initial guess */
+  gdouble delta = evaluate (map, dest, &rhs, &f);
+  while (delta > 1e-12 && n < NMAX) {
+    jacobian (map, dest, &rhs, &f, J);
+    GtsMatrix * iJ = gts_matrix3_inverse (J);
+    if (!iJ) {
+      gts_matrix_print (J, stderr);
+      g_assert_not_reached ();
+    }
+    int i, j;
+    for (i = 0; i < 3; i++)
+      for (j = 0; j < 3; j++)
+	(&dest->x)[i] -= iJ[i][j]*(&f.x)[j];
+    gts_matrix_destroy (iJ);
+    delta = evaluate (map, dest, &rhs, &f);
+    n++;
+  }
+  g_assert (n < NMAX);
+}
+
+static void normalized_jacobian (GfsMap * map, const FttVector * p, GtsMatrix * J)
+{
+  FttVector f, rhs = {0., 0., 0.};
+  evaluate (map, p, &rhs, &f);
+  jacobian (map, p, &rhs, &f, J);
+  /* normalize */
+  int i, j;
+  for (i = 0; i < 3; i++) {
+    gdouble h = 0.;
+    for (j = 0; j < 3; j++)
+      h += J[j][i]*J[j][i];
+    h = sqrt (h);
+    for (j = 0; j < 3; j++)
+      J[j][i] /= h;
+  }
+}
+
+static void map_inverse_vector (GfsMap * map, const FttVector * p,
+				const FttVector * src, FttVector * dest)
+{
+  GtsMatrix J[4];
+  normalized_jacobian (map, p, J);
+  FttVector src1 = *src; /* in case src and dest are identical */
+  int i, j;
+  for (i = 0; i < 3; i++) {
+    (&dest->x)[i] = 0.;
+    for (j = 0; j < 3; j++)
+      (&dest->x)[i] += (&src1.x)[j]*J[i][j];
+  }
+}
+
+static void map_transform_vector (GfsMap * map, const FttVector * p,
+				  const FttVector * src, FttVector * dest)
+{
+  GtsMatrix J[4];
+  normalized_jacobian (map, p, J);
+  GtsMatrix * iJ = gts_matrix3_inverse (J);
+  if (!iJ) {
+    gts_matrix_print (J, stderr);
+    g_assert_not_reached ();
+  }
+  FttVector src1 = *src; /* in case src and dest are identical */
+  int i, j;
+  for (i = 0; i < 3; i++) {
+    (&dest->x)[i] = 0.;
+    for (j = 0; j < 3; j++)
+      (&dest->x)[i] += (&src1.x)[j]*iJ[i][j];
+  }
+  gts_matrix_destroy (iJ);
+}
+
 static void inverse_cell (GfsMap * map, const FttVector * src, FttVector * dest)
 {
   gint i;
@@ -80,7 +185,10 @@ static void inverse_cell (GfsMap * map, const FttVector * src, FttVector * dest)
 
 static void gfs_map_init (GfsMap * map)
 {
-  map->transform = map->inverse = not_implemented;
+  map->inverse = not_implemented;
+  map->transform = map_transform;
+  map->inverse_vector = map_inverse_vector;
+  map->transform_vector = map_transform_vector;
   map->inverse_cell = inverse_cell;
 }
 
@@ -291,9 +399,10 @@ static void gfs_map_transform_read (GtsObject ** o, GtsFile * fp)
     map->m = p;
   }
 
-  map->m[0][3] += map->translate[0];
-  map->m[1][3] += map->translate[1];
-  map->m[2][3] += map->translate[2];
+  gdouble L = gfs_object_simulation (map)->physical_params.L;
+  map->m[0][3] += map->translate[0]/L;
+  map->m[1][3] += map->translate[1]/L;
+  map->m[2][3] += map->translate[2]/L;
 
   gts_matrix_destroy (map->im);
   map->im = gts_matrix_inverse (map->m);
