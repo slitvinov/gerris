@@ -175,6 +175,7 @@ GtsObjectClass ** gfs_classes (void)
         gfs_variable_stream_function_class (),
 #endif /* FTT_2D */
         gfs_variable_poisson_class (),
+      gfs_hydrostatic_pressure_class (),
       gfs_variable_age_class (),
       gfs_variable_curvature_class (),
         gfs_variable_position_class (),
@@ -194,8 +195,11 @@ GtsObjectClass ** gfs_classes (void)
     gfs_init_vorticity_class (),
     gfs_init_wave_class (),
 
+    gfs_generic_metric_class (),
+      gfs_metric_class (),
+      gfs_metric_cubed_class (),
+      gfs_metric_cubed1_class (),
     gfs_metric_lon_lat_class (),
-    gfs_metric_cubed_class (),
     gfs_metric_stretch_class (),
 
     gfs_adapt_class (),
