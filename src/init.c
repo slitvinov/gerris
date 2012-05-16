@@ -204,6 +204,7 @@ GtsObjectClass ** gfs_classes (void)
           gfs_metric_class (),
           gfs_metric_cubed_class (),
           gfs_metric_cubed1_class (),
+          gfs_metric_laplace_class (),
 
     gfs_adapt_class (),
       gfs_adapt_vorticity_class (),
