@@ -2346,8 +2346,14 @@ gdouble gfs_divergence (FttCell * cell,
   g_return_val_if_fail (cell != NULL, 0.);
   g_return_val_if_fail (v != NULL, 0.);
 
-  for (c = 0; c < FTT_DIMENSION; c++)
-    div += gfs_center_gradient (cell, c, v[c]->i);
+  if (v[0]->domain->scale_metric)
+    for (c = 0; c < FTT_DIMENSION; c++)
+      div += gfs_center_gradient (cell, c, v[c]->i)
+	/(* v[0]->domain->scale_metric) (v[0]->domain, cell, c);
+  else
+    for (c = 0; c < FTT_DIMENSION; c++)
+      div += gfs_center_gradient (cell, c, v[c]->i);
+
   return div/ftt_cell_size (cell);
 }
 
@@ -2362,26 +2368,44 @@ gdouble gfs_divergence (FttCell * cell,
 gdouble gfs_vorticity (FttCell * cell,
 		       GfsVariable ** v)
 {
-  gdouble size;
-#if (!FTT_2D)
-  FttVector vort;
-#endif /* FTT_3D */
-
   g_return_val_if_fail (cell != NULL, 0.);
   g_return_val_if_fail (v != NULL, 0.);
 
-  size = ftt_cell_size (cell);
 #if FTT_2D
-  return (gfs_center_gradient (cell, FTT_X, v[1]->i) -
-	  gfs_center_gradient (cell, FTT_Y, v[0]->i))/size;
+  if (GFS_IS_MIXED (cell))
+    /* fixme: the formulation below should also work (better) for solid cells */
+    return (gfs_center_gradient (cell, FTT_X, v[1]->i) -
+	    gfs_center_gradient (cell, FTT_Y, v[0]->i))/ftt_cell_size (cell);
+  else {
+    FttCellNeighbors n;
+    ftt_cell_neighbors (cell, &n);
+    FttCellFace f = { cell };
+    double circ = 0.;
+    f.d = FTT_RIGHT; f.neighbor = n.c[f.d];
+    circ += gfs_face_interpolated_value_generic (&f, v[1])*
+      gfs_domain_face_fraction (v[0]->domain, &f);
+    f.d = FTT_LEFT; f.neighbor = n.c[f.d];
+    circ -= gfs_face_interpolated_value_generic (&f, v[1])*
+      gfs_domain_face_fraction (v[0]->domain, &f);
+    f.d = FTT_TOP; f.neighbor = n.c[f.d];
+    circ -= gfs_face_interpolated_value_generic (&f, v[0])*
+      gfs_domain_face_fraction (v[0]->domain, &f);
+    f.d = FTT_BOTTOM; f.neighbor = n.c[f.d];
+    circ += gfs_face_interpolated_value_generic (&f, v[0])*
+      gfs_domain_face_fraction (v[0]->domain, &f);
+    /* vorticity is circulation over area */
+    return circ*ftt_cell_size (cell)/gfs_cell_volume (cell, v[0]->domain);
+  }
 #else  /* FTT_3D */
+  /* fixme: does not work with metric */
+  FttVector vort;
   vort.x = (gfs_center_gradient (cell, FTT_Y, v[2]->i) -
-	    gfs_center_gradient (cell, FTT_Z, v[1]->i))/size;
+	    gfs_center_gradient (cell, FTT_Z, v[1]->i));
   vort.y = (gfs_center_gradient (cell, FTT_Z, v[0]->i) -
-	    gfs_center_gradient (cell, FTT_X, v[2]->i))/size;
+	    gfs_center_gradient (cell, FTT_X, v[2]->i));
   vort.z = (gfs_center_gradient (cell, FTT_X, v[1]->i) -
-	    gfs_center_gradient (cell, FTT_Y, v[0]->i))/size;
-  return sqrt (vort.x*vort.x + vort.y*vort.y + vort.z*vort.z);
+	    gfs_center_gradient (cell, FTT_Y, v[0]->i));
+  return sqrt (vort.x*vort.x + vort.y*vort.y + vort.z*vort.z)/ftt_cell_size (cell);
 #endif /* FTT_3D */
 }
 
