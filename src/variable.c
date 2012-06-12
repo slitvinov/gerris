@@ -99,11 +99,11 @@ static void gfs_variable_destroy (GtsObject * object)
   (* GTS_OBJECT_CLASS (gfs_variable_class ())->parent_class->destroy) (object);
 }
 
-static void gfs_variable_class_init (GfsVariableClass * klass)
+static void gfs_variable_class_init (GtsObjectClass * klass)
 {
-  GTS_OBJECT_CLASS (klass)->read = gfs_variable_read;
-  GTS_OBJECT_CLASS (klass)->write = gfs_variable_write;
-  GTS_OBJECT_CLASS (klass)->destroy = gfs_variable_destroy;
+  klass->read = gfs_variable_read;
+  klass->write = gfs_variable_write;
+  klass->destroy = gfs_variable_destroy;
 }
 
 static void gfs_variable_init (GfsVariable * v)
@@ -260,6 +260,39 @@ void gfs_variable_set_vector (GfsVariable ** v, guint n)
     for (j = 0; j < n; j++)
       v[i]->vector[j] = v[j];
   }
+}
+
+/**
+ * gfs_variable_clone:
+ * @v: a #GfsVariable.
+ * @name: a name.
+ *
+ * Returns: a new #GfsVariable called @name and clone of @v.
+ */
+GfsVariable * gfs_variable_clone (GfsVariable * v, gchar * name)
+{
+  g_return_val_if_fail (v != NULL, NULL);
+  g_return_val_if_fail (name != NULL, NULL);
+
+  FILE * f = tmpfile ();
+  gchar * s = v->name;
+  v->name = name;
+  GtsObject * o = GTS_OBJECT (v);
+  (* o->klass->write) (o, f);
+  rewind (f);
+  v->name = s;
+  GtsFile * fp = gts_file_new (f);
+  GtsObject * clone = gts_object_new (o->klass);
+  gfs_object_simulation_set (clone, gfs_object_simulation (o));
+  (* o->klass->read) (&clone, fp);
+  if (fp->type == GTS_ERROR)
+    g_error ("gfs_variable_clone:\n%d:%d:%s", fp->line, fp->pos, fp->error);
+  gts_file_destroy (fp);
+  fclose (f);
+  GFS_VARIABLE (clone)->units = v->units;
+  GFS_VARIABLE (clone)->fine_coarse = v->fine_coarse;
+  GFS_VARIABLE (clone)->coarse_fine = v->coarse_fine;
+  return GFS_VARIABLE (clone);
 }
 
 /** \endobject{GfsVariable} */
@@ -970,6 +1003,12 @@ static void variable_poisson_write (GtsObject * o, FILE * fp)
   gfs_multilevel_params_write (&GFS_VARIABLE_POISSON (o)->par, fp);
 }
 
+static void has_dirichlet (FttCell * cell, GfsVariable * p)
+{
+  if (((cell)->flags & GFS_FLAG_DIRICHLET) != 0)
+    p->centered = FALSE;
+}
+
 typedef struct {
   GfsFunction * f;
   GfsVariable * div;
@@ -993,6 +1032,8 @@ static gboolean variable_poisson_event (GfsEvent * event, GfsSimulation * sim)
     GfsVariablePoisson * pv = GFS_VARIABLE_POISSON (v);
 
     gfs_domain_surface_bc (domain, v);
+    gfs_domain_traverse_mixed (domain, FTT_PRE_ORDER, FTT_TRAVERSE_LEAFS,
+			       (FttCellTraverseFunc) has_dirichlet, v);
     DivData p = { GFS_VARIABLE_FUNCTION (event)->f, div };
     gfs_domain_traverse_leaves (domain, (FttCellTraverseFunc) rescale_div, &p);
     gfs_poisson_coefficients (domain, NULL, FALSE, TRUE, TRUE);
