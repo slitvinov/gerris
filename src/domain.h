@@ -124,6 +124,8 @@ struct _GfsDomain {
   GSList * projections; /**< list of GfsDomainProjection associated with this domain */
 
   gboolean has_rotated_bc; /**< whether the domain uses "rotated" edges */
+
+  void (* traverse_layers) (GfsDomain *, FttCellTraverseFunc, gpointer);
 };
 
 struct _GfsDomainClass {
@@ -154,6 +156,13 @@ void         gfs_domain_cell_traverse         (GfsDomain * domain,
 					       gpointer data);
 #define gfs_domain_traverse_leaves(d,f,data)  (gfs_domain_cell_traverse(d, \
 					    FTT_PRE_ORDER, FTT_TRAVERSE_LEAFS, -1, f,data))
+FttCellTraverse * gfs_domain_cell_traverse_new (GfsDomain * domain,
+						FttTraverseType order,
+						FttTraverseFlags flags,
+						gint max_depth);
+void         gfs_domain_traverse_layers       (GfsDomain * domain,
+					       FttCellTraverseFunc func,
+					       gpointer data);
 void         gfs_domain_cell_traverse_condition (GfsDomain * domain,
 						 FttTraverseType order,
 						 FttTraverseFlags flags,
