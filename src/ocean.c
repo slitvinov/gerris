@@ -1,5 +1,5 @@
 /* Gerris - The GNU Flow Solver
- * Copyright (C) 2004 Stéphane Popinet
+ * Copyright (C) 2004-2012 Stéphane Popinet
  * National Institute of Water and Atmospheric Research
  *
  * This program is free software; you can redistribute it and/or
@@ -36,16 +36,6 @@
  * The linearised shallow-water solver.
  * \beginobject{GfsOcean}
  */
-
-static void reset_gradients (FttCell * cell, gpointer * data)
-{
-  GfsVariable ** g = data[0];
-  guint * dimension = data[1];    
-  FttComponent c;
-
-  for (c = 0; c < *dimension; c++)
-    GFS_VALUE (cell, g[c]) = 0.;
-}
 
 static void correct_normal_velocity (FttCellFace * face,
 				     gpointer * data)
@@ -114,7 +104,6 @@ static void gfs_correct_normal_velocities_weighted (GfsDomain * domain,
 						    gdouble dt,
 						    gboolean weighted)
 {
-  gpointer data[3];
   FttComponent c;
     
   g_return_if_fail (domain != NULL);
@@ -124,15 +113,13 @@ static void gfs_correct_normal_velocities_weighted (GfsDomain * domain,
   for (c = 0; c < dimension; c++)
     g[c] = gfs_temporary_variable (domain);
   gfs_variable_set_vector (g, dimension);
-  data[0] = g;
-  data[1] = &dimension;
-  gfs_domain_cell_traverse (domain, FTT_PRE_ORDER, FTT_TRAVERSE_LEAFS, -1,
-			    (FttCellTraverseFunc) reset_gradients, data);
+  gfs_reset_gradients (domain, dimension, g);
   if (weighted) {
     gfs_correct_normal_velocities (domain, dimension, p, g, dt);
     gfs_scale_gradients (domain, dimension, g);
   }
   else {
+    gpointer data[3];
     data[0] = p;
     data[1] = g;
     data[2] = &dt;
@@ -165,10 +152,10 @@ static void scale_divergence_helmoltz (FttCell * cell, FreeSurfaceParams * p)
   gdouble h = ftt_cell_size (cell);
   gdouble c = 2.*h*h/(THETA*p->G*p->dt*p->dt);
 
-  if (GFS_IS_MIXED (cell))
 #if FTT_2D
-    c *= GFS_STATE (cell)->solid->a;
+  c *= gfs_domain_cell_fraction (p->dia->domain, cell);
 #else /* 3D */
+  if (GFS_IS_MIXED (cell)) /* fixme: no metric yet */
     c *= GFS_STATE (cell)->solid->s[FTT_FRONT];
 #endif /* 3D */
 
@@ -263,9 +250,6 @@ static void gfs_free_surface_pressure (GfsDomain * toplayer,
 
 static void normal_velocities (GfsDomain * domain, GfsVariable ** u)
 {
-  g_return_if_fail (domain != NULL);
-  g_return_if_fail (div != NULL);
-
   gfs_domain_face_traverse (domain, FTT_XY,
 			    FTT_PRE_ORDER, FTT_TRAVERSE_LEAFS, -1,
 			    (FttFaceTraverseFunc) gfs_face_reset_normal_velocity, NULL);
@@ -311,8 +295,7 @@ static void ocean_run (GfsSimulation * sim)
     gfs_simulation_set_timestep (sim);
 
     normal_velocities (domain, gfs_domain_velocity (domain));
-    gfs_domain_cell_traverse (domain, FTT_PRE_ORDER, FTT_TRAVERSE_LEAFS, -1,
-			      (FttCellTraverseFunc) gfs_normal_divergence_2D, div);
+    gfs_domain_traverse_leaves (domain, (FttCellTraverseFunc) gfs_normal_divergence_2D, div);
 
     gfs_domain_bc (domain, FTT_TRAVERSE_LEAFS, -1, p);
 
@@ -336,8 +319,8 @@ static void ocean_run (GfsSimulation * sim)
     gfs_domain_timer_start (domain, "free_surface_pressure");
     GfsVariable * divn = gfs_temporary_variable (domain);
     normal_velocities (domain, gfs_domain_velocity (domain));
-    gfs_domain_cell_traverse (domain, FTT_PRE_ORDER, FTT_TRAVERSE_LEAFS, -1,
-			      (FttCellTraverseFunc) gfs_normal_divergence_2D, divn);
+    gfs_domain_traverse_leaves (domain, (FttCellTraverseFunc) gfs_normal_divergence_2D, divn);
+    gfs_poisson_coefficients (domain, fH, TRUE, TRUE, TRUE);
     gfs_free_surface_pressure (domain, &sim->approx_projection_params, &sim->advection_params,
 			       p, divn, div, res, sim->physical_params.g);
     gts_object_destroy (GTS_OBJECT (divn));
