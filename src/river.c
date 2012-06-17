@@ -262,6 +262,41 @@ static void riemann_hllc (const gdouble * uL, const gdouble * uR,
   }
 }
 
+/*
+ * uL: left state vector [h,u,v,zb].
+ * uR: right state vector.
+ * g: acceleration of gravity.
+ * f: flux vector.
+ *
+ * Fills @f by solving an approximate Riemann problem using the kinetic
+ * scheme. See Audusse & Bristeau, JCP, 206, 2005.
+ */
+
+#define SQRT3 1.73205080756888
+
+static void riemann_kinetic (const gdouble * uL, const gdouble * uR,
+			     gdouble g,
+			     gdouble * f)
+{
+  gdouble ci, Mp, Mm, cig;
+
+  ci = sqrt (g*uL[0]/2.);
+  Mp = MAX (uL[1] + ci*SQRT3, 0.);
+  Mm = MAX (uL[1] - ci*SQRT3, 0.);
+  cig = ci/(6.*g*SQRT3);
+  f[0] = cig*3.*(Mp*Mp - Mm*Mm);
+  f[1] = cig*2.*(Mp*Mp*Mp - Mm*Mm*Mm);
+
+  ci = sqrt (g*uR[0]/2.);
+  Mp = MIN (uR[1] + ci*SQRT3, 0.);
+  Mm = MIN (uR[1] - ci*SQRT3, 0.);
+  cig = ci/(6.*g*SQRT3);
+  f[0] += cig*3.*(Mp*Mp - Mm*Mm);
+  f[1] += cig*2.*(Mp*Mp*Mp - Mm*Mm*Mm);
+
+  f[2] = (f[0] > 0. ? uL[2] : uR[2])*f[0];
+}
+
 #define U 1
 #define V 2
 
@@ -355,7 +390,7 @@ static void face_fluxes (FttCellFace * face, GfsRiver * r)
   uL[2] = CFL_CLAMP (uL[2], umax);
   uR[2] = CFL_CLAMP (uR[2], umax);
 
-  riemann_hllc (uL, uR, r->g, f);
+  (* r->scheme) (uL, uR, r->g, f);
 
   gdouble dt = gfs_domain_face_fraction (GFS_DOMAIN (r), face)*r->dt/h;
   f[0] *= dt;
@@ -670,9 +705,11 @@ static void river_read (GtsObject ** o, GtsFile * fp)
   GfsRiver * river = GFS_RIVER (*o);
   if (fp->type == '{') {
     double dry;
+    gchar * scheme = NULL;
     GtsFileVariable var[] = {
       {GTS_UINT,   "time_order", TRUE, &river->time_order},
       {GTS_DOUBLE, "dry",        TRUE, &dry},
+      {GTS_STRING, "scheme",     TRUE, &scheme},
       {GTS_NONE}
     };
     gts_file_assign_variables (fp, var);
@@ -680,6 +717,15 @@ static void river_read (GtsObject ** o, GtsFile * fp)
       return;
     if (var[1].set)
       river->dry = dry/GFS_SIMULATION (river)->physical_params.L;
+    if (scheme) {
+      if (!strcmp (scheme, "hllc"))
+	river->scheme = riemann_hllc;
+      else if (!strcmp (scheme, "kinetic"))
+	river->scheme = riemann_kinetic;
+      else
+	gts_file_error (fp, "unknown scheme '%s'", scheme);
+      g_free (scheme);
+    }
   }
 }
 
@@ -691,9 +737,11 @@ static void river_write (GtsObject * o, FILE * fp)
   fprintf (fp, " {\n"
 	   "  time_order = %d\n"
 	   "  dry = %g\n"
+	   "  scheme = %s\n"
 	   "}",
 	   river->time_order,
-	   river->dry*GFS_SIMULATION (river)->physical_params.L);
+	   river->dry*GFS_SIMULATION (river)->physical_params.L,
+	   river->scheme == riemann_hllc ? "hllc" : "kinetic");
 }
 
 static void river_class_init (GfsSimulationClass * klass)
@@ -797,6 +845,7 @@ static void river_init (GfsRiver * r)
 
   r->time_order = 2;
   r->dry = 1e-6;
+  r->scheme = riemann_hllc;
 }
 
 GfsSimulationClass * gfs_river_class (void)
@@ -1127,10 +1176,10 @@ static void source_pipe_write (GtsObject * o, FILE * fp)
 #define DQ (1e-4/L3)
 
 static double flow_rate_Q (double z1, double h1, double z2, double h2,
-			   double l, GfsSourcePipe * p,
+			   double l, double g, GfsSourcePipe * p,
 			   double a1, double a2, double Q)
 {
-  double Q1 = (*p->flow_rate) (z1, h1 - Q/a1, z2, h2 + Q/a2, l, p);
+  double Q1 = (*p->flow_rate) (z1, h1 - Q/a1, z2, h2 + Q/a2, l, g, p);
   if (Q1 > 0.) Q1 = MIN (Q1, a1*h1);
   if (Q1 < 0.) Q1 = MAX (Q1, - a2*h2);
   return Q1;
@@ -1149,7 +1198,7 @@ static gboolean source_pipe_event (GfsEvent * event, GfsSimulation * sim)
     p->ecell = gfs_domain_locate (domain, end, -1, NULL);
     p->Q = 0.;
     if (p->scell && p->ecell && p->scell != p->ecell) {
-      gdouble L = sim->physical_params.L;
+      gdouble L = sim->physical_params.L, g = sim->physical_params.g;
       GfsVariable * h = GFS_RIVER (sim)->v[0], * zb = GFS_RIVER (sim)->zb;
       gdouble h1 = L*GFS_VALUE (p->scell, h), z1 = L*GFS_VALUE (p->scell, zb);
       gdouble h2 = L*GFS_VALUE (p->ecell, h), z2 = L*GFS_VALUE (p->ecell, zb);      
@@ -1162,9 +1211,9 @@ static gboolean source_pipe_event (GfsEvent * event, GfsSimulation * sim)
       gdouble a2 = L2*gfs_cell_volume (p->ecell, GFS_DOMAIN (sim))/sim->advection_params.dt;
 
       /* secant-bisection root-finding: solves flow_rate(h, l, Q) - Q = 0 for the flow rate Q */
-      p->Q = (*p->flow_rate) (z1, h1, z2, h2, l, p)/L3;
+      p->Q = (*p->flow_rate) (z1, h1, z2, h2, l, g, p)/L3;
       gdouble Q1 = p->Q*2.;
-      gdouble v1 = flow_rate_Q (z1, h1, z2, h2, l, p, a1, a2, Q1*L3)/L3 - Q1;
+      gdouble v1 = flow_rate_Q (z1, h1, z2, h2, l, g, p, a1, a2, Q1*L3)/L3 - Q1;
       gdouble Q2 = 0.;
       gdouble v2 = p->Q;
       if (fabs (v1) > DQ && fabs (v2) > DQ) {
@@ -1182,7 +1231,7 @@ static gboolean source_pipe_event (GfsEvent * event, GfsSimulation * sim)
 	  p->Q = (v1*Q2 - v2*Q1)/(v1 - v2);
 	  do {
 	    Qb = p->Q;
-	    gdouble v = flow_rate_Q (z1, h1, z2, h2, l, p, a1, a2, p->Q*L3)/L3 - p->Q;
+	    gdouble v = flow_rate_Q (z1, h1, z2, h2, l, g, p, a1, a2, p->Q*L3)/L3 - p->Q;
 	    if (v < 0.) {
 	      v1 = v; Q1 = p->Q;
 	    }
@@ -1228,6 +1277,7 @@ static gdouble source_pipe_value (GfsSourceGeneric * s,
 static double pipe_flow_rate (double z1, double h1, /* terrain elevation and flow depth at inlet */
 			      double z2, double h2, /* terrain elevation and flow depth at outlet */
 			      double l,             /* pipe length */
+			      double g,             /* acceleration of gravity */
 			      GfsSourcePipe * p)
 {
   gdouble r = p->diameter/2.;

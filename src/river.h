@@ -45,6 +45,7 @@ struct _GfsRiver {
   GfsCenterGradient gradient;
   guint time_order;
   gdouble dry;
+  void (* scheme) (const gdouble * uL, const gdouble * uR, gdouble g, gdouble * f);
 };
 
 #define GFS_RIVER(obj)            GTS_OBJECT_CAST (obj,\
@@ -98,6 +99,7 @@ struct _GfsSourcePipe {
   double (* flow_rate) (double z1, double h1, /* terrain elevation and flow depth at inlet */
 			double z2, double h2, /* terrain elevation and flow depth at outlet */
 			double l,             /* pipe length */
+			double g,             /* acceleration of gravity */
 			GfsSourcePipe * p);
   FttVector start, end;
   gdouble diameter;
