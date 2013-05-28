@@ -22,6 +22,7 @@
 #include "adaptive.h"
 #include "output.h"
 #include "solid.h"
+#include "mpi_boundary.h"
 
 /* GfsElectroHydro: Header */
 
@@ -190,6 +191,18 @@ static void gfs_electro_hydro_destroy (GtsObject * object)
   (* GTS_OBJECT_CLASS (gfs_electro_hydro_class ())->parent_class->destroy) (object);
 }
 
+/**
+ * Electric field boundary condition.
+ * \beginobject{GfsBcE}
+ */
+
+/* GfsBcE: Header */
+
+#define GFS_IS_BC_E(obj)         (gts_object_is_from_class (obj,	\
+					 gfs_bc_E_class ()))
+
+GfsBcClass * gfs_bc_E_class  (void);
+
 static void setting_E_from_phi (FttCellFace * f, GfsBc * b)
 {
   if (b->v->component == f->d/2) {
@@ -219,6 +232,51 @@ static void face_setting_E_from_phi(FttCellFace *f, GfsBc * b)
     GFS_STATE (f->cell)->f[f->d].v = GFS_VALUE (f->neighbor, b->v);
 }
 
+static void gfs_bc_E_init (GfsBc * object)
+{
+  object->bc =                     (FttFaceTraverseFunc) setting_E_from_phi;
+  object->homogeneous_bc =         (FttFaceTraverseFunc) setting_E_from_phi;
+  object->face_bc =                (FttFaceTraverseFunc) face_setting_E_from_phi;
+}
+
+GfsBcClass * gfs_bc_E_class (void)
+{
+  static GfsBcClass * klass = NULL;
+
+  if (klass == NULL) {
+    GtsObjectClassInfo gfs_bc_E_info = {
+      "GfsBcE",
+      sizeof (GfsBc),
+      sizeof (GfsBcClass),
+      (GtsObjectClassInitFunc) NULL,
+      (GtsObjectInitFunc) gfs_bc_E_init,
+      (GtsArgSetFunc) NULL,
+      (GtsArgGetFunc) NULL
+    };
+    klass = gts_object_class_new (GTS_OBJECT_CLASS (gfs_bc_class ()),
+				  &gfs_bc_E_info);
+  }
+
+  return klass;
+}
+
+/** \endobject{GfsBcE} */
+
+static void box_set_efield_boundary (GfsBox * box, GfsElectroHydro * elec)
+{
+  FttDirection d;
+  for (d = 0; d < FTT_NEIGHBORS; d++)
+    if (!GFS_IS_BOUNDARY_MPI (box->neighbor[d]) &&
+	GFS_IS_BOUNDARY (box->neighbor[d])) {
+      GfsBoundary * b = GFS_BOUNDARY (box->neighbor[d]);
+      FttComponent c;
+      for (c = 0; c < FTT_DIMENSION; c++) {
+	GfsBc * bc = gfs_bc_new (gfs_bc_E_class(), elec->E[c], FALSE);
+	gfs_boundary_add_bc (b, bc);
+      }
+    }
+}
+
 static void gfs_electro_hydro_init (GfsElectroHydro * object)
 {
   GfsDomain * domain = GFS_DOMAIN (object);
@@ -244,14 +302,6 @@ static void gfs_electro_hydro_init (GfsElectroHydro * object)
   object->charge = gfs_function_new (gfs_function_class (), 0.);
   gfs_function_set_units (object->charge, -3.);
   gfs_object_simulation_set (object->charge, object);
-
-  /* default BC for the electric field */
-  for (c = 0; c < FTT_DIMENSION; c++) {
-    GfsBc * bc = gfs_bc_new (gfs_bc_neumann_class(), object->E[c], FALSE);
-    bc->bc      = (FttFaceTraverseFunc) setting_E_from_phi;
-    bc->face_bc = (FttFaceTraverseFunc) face_setting_E_from_phi;
-    gfs_variable_set_default_bc (object->E[c], bc);
-  }
 }
 
 static void gfs_electro_hydro_run (GfsSimulation * sim);
@@ -359,7 +409,7 @@ static void set_dive (FttCell * cell, OhmicParams * p)
 {
   GFS_VALUE (cell, p->rhs) = gfs_function_value (p->charge, cell);
 }
-	
+
 static void poisson_electric (GfsElectroHydro * elec, gdouble dt)
 {
   GfsMultilevelParams * par = &elec->electric_projection_params;
@@ -466,6 +516,10 @@ static void gfs_electro_hydro_run (GfsSimulation * sim)
   }
   gfs_simulation_init (sim);
 
+  /* default BC for the electric field */
+  gts_container_foreach (GTS_CONTAINER (domain),
+  			 (GtsFunc) box_set_efield_boundary, elec);
+
   i = domain->variables;
   while (i) {
     if (GFS_IS_VARIABLE_RESIDUAL (i->data))
@@ -477,7 +531,7 @@ static void gfs_electro_hydro_run (GfsSimulation * sim)
   if (sim->time.i == 0) {
     gfs_approximate_projection (domain,
 				&sim->approx_projection_params,
-				&sim->advection_params,
+				sim->advection_params.dt,
 				p, sim->physical_params.alpha, res, g, NULL);
     gfs_simulation_set_timestep (sim);
     gfs_advance_tracers (sim, sim->advection_params.dt/2.);
@@ -497,7 +551,7 @@ static void gfs_electro_hydro_run (GfsSimulation * sim)
     gfs_variables_swap (p, pmac);
     gfs_mac_projection (domain,
     			&sim->projection_params, 
-    			&sim->advection_params,
+    			sim->advection_params.dt/2.,
 			p, sim->physical_params.alpha, gmac, NULL);
     gfs_variables_swap (p, pmac);
 
@@ -528,7 +582,7 @@ static void gfs_electro_hydro_run (GfsSimulation * sim)
 
     gfs_approximate_projection (domain,
    				&sim->approx_projection_params, 
-    				&sim->advection_params, 
+    				sim->advection_params.dt, 
 				p, sim->physical_params.alpha, res, g, NULL);
 
     sim->time.t = sim->tnext;
@@ -836,6 +890,7 @@ const gchar * g_module_check_init (void)
   gfs_electro_hydro_class ();
   gfs_electro_hydro_axi_class ();
   gfs_source_electric_class ();
+  gfs_bc_E_class ();
   gfs_output_potential_stats_class ();
   return NULL;
 } 
