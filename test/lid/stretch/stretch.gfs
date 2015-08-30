@@ -40,7 +40,7 @@
 # Version: 100208
 # Required files: xprofile yprofile xprof.ghia yprof.ghia
 # Running time: 10 minutes
-# Generated files: xprof yprof xprof.eps yprof.eps velocity.eps
+# Generated files: xprof.eps yprof.eps velocity.eps
 #
 # The simulation domain has 1 GfsBox
 2 1 GfsSimulation GfsBox GfsGEdge {
